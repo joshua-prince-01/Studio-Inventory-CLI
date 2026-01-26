@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # dir names:
-base_dir = os.path.expanduser("~/PycharmProjects/PythonProject_studio_inventory")
+base_dir = os.path.expanduser("/")
 
-mcmaster_dir = "McMaster_Items"
+mcmaster_dir = "../McMaster_Items"
 receipts_dir = "receipts"
 packing_dir = "packing_lists"
 

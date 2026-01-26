@@ -156,8 +156,8 @@ def parse_receipt(pdf_path, page_num=0, debug=True):
         return items
 
 if __name__ == "__main__":
-    base = os.path.expanduser("~/PycharmProjects/PythonProject_studio_inventory")
-    receipts_dir = os.path.join(base, "McMaster_Items", "receipts")
+    base = os.path.expanduser("/")
+    receipts_dir = os.path.join(base, "../McMaster_Items", "receipts")
 
     pdfs = sorted(f for f in os.listdir(receipts_dir) if f.lower().endswith(".pdf"))
     if not pdfs:
