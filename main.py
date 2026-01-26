@@ -369,7 +369,8 @@ def main():
         print(inventory_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
 
     # EXPORT CSVs
-    default_export_dir = (receipts_folder / "exports").resolve()
+    default_export_dir = (receipts_folder.parent / "exports").resolve()
+
     export_dir = pick_export_folder(default_export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
