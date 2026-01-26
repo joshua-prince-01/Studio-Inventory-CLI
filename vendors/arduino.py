@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
+
 import pdfplumber
 
 
@@ -10,19 +11,30 @@ import pdfplumber
 # -------------------------------------------------
 
 def detect(pdf_path: str) -> bool:
-    with pdfplumber.open(pdf_path) as pdf:
-        t0 = (pdf.pages[0].extract_text() or "").upper()
-    return "ARDUINO" in t0
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            t0 = (pdf.pages[0].extract_text() or "").upper()
+        # Arduino receipts/invoices usually have "ARDUINO, LLC" and "store-usa@arduino.cc"
+        return ("ARDUINO" in t0) and ("ARDUINO.CC" in t0 or "STORE-" in t0 or "CASH SALE" in t0 or "INVOICE" in t0)
+    except Exception:
+        return False
 
 
 # -------------------------------------------------
 # Order-level parsing
 # -------------------------------------------------
 
+TOTALS_BLOCK_RE = re.compile(
+    r"Total Value\s+Shipping Cost\s+Total Tax\s+Final Amount\s*\n"
+    r"\$\s*([0-9]+\.[0-9]{2})\s+\$\s*([0-9]+\.[0-9]{2})\s+\$\s*([0-9]+\.[0-9]{2})\s+\$\s*([0-9]+\.[0-9]{2})",
+    re.I,
+)
+
 def parse_order(pdf_path: str, debug: bool = False) -> dict:
     text = _all_text(pdf_path)
 
-    invoice = _find(r"(CASH SALE n\.|INVOICE n\.)\s*([A-Z0-9/]+)", text, group=2)
+    # Cash sale / invoice numbers
+    invoice = _find(r"(?:CASH SALE n\.|INVOICE n\.)\s*([A-Z0-9/]+)", text)
     sales_order = _find(r"Sales Order\s*#\s*([A-Z0-9]+)", text)
 
     invoice_date = (
@@ -30,14 +42,17 @@ def parse_order(pdf_path: str, debug: bool = False) -> dict:
         or _find(r"Invoice Date:\s*([0-9/]+)", text)
     )
 
-    total_value = _money_after("Total Value", text)
-    shipping = _money_after("Shipping Cost", text)
-    tax = _money_after("Total Tax", text)
-    total = _money_after("Final Amount", text)
+    merchandise = shipping = tax = total = None
+    tm = TOTALS_BLOCK_RE.search(text)
+    if tm:
+        merchandise = float(tm.group(1))
+        shipping = float(tm.group(2))
+        tax = float(tm.group(3))
+        total = float(tm.group(4))
 
     if debug:
         print(f"[ARDUINO] invoice={invoice} so={sales_order} date={invoice_date} "
-              f"value={total_value} ship={shipping} tax={tax} total={total}")
+              f"value={merchandise} ship={shipping} tax={tax} total={total}")
 
     return {
         "vendor": "arduino",
@@ -47,7 +62,7 @@ def parse_order(pdf_path: str, debug: bool = False) -> dict:
         "account_number": None,
         "payment_date": None,
         "credit_card": None,
-        "merchandise": total_value,
+        "merchandise": merchandise,
         "shipping": shipping,
         "sales_tax": tax,
         "total": total,
@@ -58,42 +73,66 @@ def parse_order(pdf_path: str, debug: bool = False) -> dict:
 # Line items
 # -------------------------------------------------
 
-SKU_HEADER_RE = re.compile(r"^([A-Z0-9]+)\s+(.*)$")
-QTY_PRICE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s+\$\s*([0-9.]+)\s+\$\s*([0-9.]+)")
+# Row looks like:
+# ASX00061 Nano Connector Carrier 2.00 $ 11.80 $ 23.60 6%
+ITEM_ROW_RE = re.compile(
+    r"^([A-Z]{3}\d{5})\s+(.*?)\s+(\d+\.\d{2})\s+\$\s*([0-9]+\.[0-9]{2})\s+\$\s*([0-9]+\.[0-9]{2})\s+(\d+%?)\s*$",
+    re.I,
+)
 
+COO_RE = re.compile(r"^COO:\s*(.+)$", re.I)
 
 def parse_line_items(pdf_path: str, debug: bool = False) -> list[dict]:
     lines = _all_text(pdf_path).splitlines()
 
-    items = []
+    items: list[dict] = []
     current: Optional[dict] = None
 
+    def flush():
+        nonlocal current
+        if current:
+            items.append(current)
+            current = None
+
+    in_items = False
     for raw in lines:
         ln = raw.strip()
         if not ln:
             continue
 
-        if ln.startswith("Total Value"):
+        # Start of the items table is marked by header
+        if ln.startswith("SKU Description Qty Unit Price Total Value Tax"):
+            in_items = True
+            continue
+
+        if not in_items:
+            continue
+
+        # End of items block
+        if ln.startswith("Total Value Shipping Cost Total Tax Final Amount"):
             break
 
-        # SKU + description
-        m = SKU_HEADER_RE.match(ln)
-        if m and len(m.group(1)) >= 5:
-            if current:
-                items.append(current)
+        m = ITEM_ROW_RE.match(ln)
+        if m:
+            flush()
+            sku = m.group(1).upper()
+            desc = m.group(2).strip()
+            qty = float(m.group(3))
+            unit_price = float(m.group(4))
+            line_total = float(m.group(5))
 
             current = {
                 "line": None,
-                "sku": m.group(1),
-                "part": m.group(1),
-                "description": m.group(2).strip(),
-                "ordered": None,
-                "shipped": None,
-                "balance": None,
-                "unit_price": None,
-                "line_total": None,
+                "sku": sku,
+                "part": sku,
+                "description": desc,
+                "ordered": int(round(qty)),
+                "shipped": int(round(qty)),
+                "balance": 0,
+                "unit_price": unit_price,
+                "line_total": line_total,
                 "mfg": "Arduino",
-                "mfg_pn": m.group(1),
+                "mfg_pn": sku,
                 "coo": None,
             }
             continue
@@ -101,22 +140,12 @@ def parse_line_items(pdf_path: str, debug: bool = False) -> list[dict]:
         if current is None:
             continue
 
-        if ln.startswith("COO:"):
-            current["coo"] = ln.split(":", 1)[1].strip()
+        cm = COO_RE.match(ln)
+        if cm:
+            current["coo"] = cm.group(1).strip()
             continue
 
-        qm = QTY_PRICE_RE.search(ln.replace("  ", " "))
-        if qm:
-            qty = float(qm.group(1))
-            current["ordered"] = int(qty)
-            current["shipped"] = int(qty)
-            current["balance"] = 0
-            current["unit_price"] = float(qm.group(2))
-            current["line_total"] = float(qm.group(3))
-            continue
-
-    if current:
-        items.append(current)
+    flush()
 
     if debug:
         print(f"[ARDUINO] parsed {len(items)} line items")
@@ -133,13 +162,6 @@ def _all_text(pdf_path: str) -> str:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
-def _find(pattern: str, text: str, group: int = 1) -> Optional[str]:
+def _find(pattern: str, text: str) -> Optional[str]:
     m = re.search(pattern, text, re.I)
-    return m.group(group).strip() if m else None
-
-
-def _money_after(label: str, text: str) -> Optional[float]:
-    m = re.search(label + r".*?\$\s*([0-9]+\.[0-9]{2})", text, re.I)
-    if not m:
-        return None
-    return float(m.group(1))
+    return m.group(1).strip() if m else None
