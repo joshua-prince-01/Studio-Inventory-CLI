@@ -134,10 +134,12 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
 
 def pick_export_folder(default_dir: Path) -> Path:
     """
-    Folder picker for export destination.
-    - Starts at default_dir
-    - Press Enter to accept default
-    - Otherwise uses the same interactive navigator
+    Export folder picker.
+
+    - Enter        → use default (even if it doesn't exist yet)
+    - pick         → browse folders interactively
+    - path         → jump to a folder
+    - folder is only created AFTER selection
     """
     default_dir = default_dir.expanduser().resolve()
 
@@ -146,28 +148,27 @@ def pick_export_folder(default_dir: Path) -> Path:
     print("\nPress Enter to use default, or type 'pick' to browse, or type a path to jump.")
     choice = input("> ").strip()
 
+    # ----------------------------------------
+    # Use default (do NOT create yet)
+    # ----------------------------------------
     if choice == "":
         return default_dir
 
+    # ----------------------------------------
+    # Browse interactively
+    # ----------------------------------------
     if choice.lower() == "pick":
-        return pick_folder_from_cwd(start_dir=default_dir)
+        start_dir = default_dir if default_dir.exists() else default_dir.parent
+        return pick_folder_from_cwd(start_dir=start_dir)
 
-    # allow typing a path directly (relative is relative to cwd)
+    # ----------------------------------------
+    # Jump to a typed path
+    # ----------------------------------------
     candidate = Path(choice).expanduser()
     if not candidate.is_absolute():
         candidate = (Path.cwd() / candidate).resolve()
 
-    if candidate.exists() and candidate.is_dir():
-        return candidate
-
-    # if it doesn't exist, ask whether to create it by navigating to parent
-    print(f"Folder does not exist yet:\n  {candidate}")
-    print("Type 'y' to create it, or anything else to browse instead.")
-    if input("> ").strip().lower() == "y":
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
-
-    return pick_folder_from_cwd(start_dir=default_dir)
+    return candidate
 
 
 # ----------------------------
