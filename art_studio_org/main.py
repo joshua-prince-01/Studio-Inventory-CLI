@@ -86,7 +86,6 @@ def pick_folder_from_cwd(start_dir=None) -> Path:
 
         print("Unrecognized input.")
 
-
 def pick_pdfs_in_folder(folder: Path) -> list[Path]:
     pdfs = sorted(list(folder.glob("*.pdf")) + list(folder.glob("*.PDF")))
     if not pdfs:
@@ -145,7 +144,8 @@ def pick_export_folder(default_dir: Path) -> Path:
 
     print("\n=== Export Folder Picker ===")
     print(f"Default export folder:\n  {default_dir}")
-    print("\nPress Enter to use default, or type 'pick' to browse, or type a path to jump.")
+    print("\nPress Enter to use default, 'q' --> quit, type 'pick' to browse, or type a path to jump.")
+
     choice = input("> ").strip()
 
     # ----------------------------------------
@@ -153,6 +153,12 @@ def pick_export_folder(default_dir: Path) -> Path:
     # ----------------------------------------
     if choice == "":
         return default_dir
+
+    # ----------------------------------------
+    # Quit if desired
+    # ----------------------------------------
+    if choice == "q":
+        raise SystemExit(0)
 
     # ----------------------------------------
     # Browse interactively
@@ -170,13 +176,11 @@ def pick_export_folder(default_dir: Path) -> Path:
 
     return candidate
 
-
 # ----------------------------
 # Ingest helpers
 # ----------------------------
 
 PACK_RE = re.compile(r"\bPacks?\s+of\s+(\d+)\b", re.I)
-
 
 def to_int(x):
     try:
@@ -184,13 +188,11 @@ def to_int(x):
     except Exception:
         return pd.NA
 
-
 def to_float(x):
     try:
         return float(str(x).replace("$", "").replace(",", "").strip())
     except Exception:
         return pd.NA
-
 
 def infer_pack_qty(description: str) -> int:
     if not description:
@@ -202,7 +204,6 @@ def infer_pack_qty(description: str) -> int:
         except Exception:
             return 1
     return 1
-
 
 def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """
@@ -336,7 +337,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     return orders_df, line_items_df, inventory_df
 
-
 # ----------------------------
 # MAIN
 # ----------------------------
@@ -388,7 +388,6 @@ def main():
     print(" ", orders_csv)
     print(" ", items_csv)
     print(" ", inv_csv)
-
 
 if __name__ == "__main__":
     main()
