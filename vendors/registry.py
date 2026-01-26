@@ -1,33 +1,20 @@
 from __future__ import annotations
 
-from typing import Sequence
-from vendors.base import VendorParser
+from typing import Optional
 
-from vendors.mcmaster import McMasterParser
-from vendors.digikey import DigiKeyParser
-from vendors.mouser import MouserParser
-from vendors.newark import NewarkParser
-from vendors.arduino import ArduinoParser
-from vendors.bambulab import BambuLabParser
+from . import digikey, mcmaster
 
+# Order matters: more-specific detectors first if needed
+PARSERS = [
+    digikey,
+    mcmaster,
+]
 
-def all_parsers() -> Sequence[VendorParser]:
-    # Order matters: put the most distinctive first if you later add overlaps
-    return [
-        McMasterParser(),
-        DigiKeyParser(),
-        MouserParser(),
-        NewarkParser(),
-        ArduinoParser(),
-        BambuLabParser(),
-    ]
-
-
-def pick_parser(pdf_path):
-    for p in all_parsers():
+def pick_parser(pdf_path: str):
+    for mod in PARSERS:
         try:
-            if p.detect(pdf_path):
-                return p
+            if mod.detect(pdf_path):
+                return mod
         except Exception:
             continue
     return None

@@ -1,24 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Protocol, Iterable, Optional, Any
+from typing import Protocol, Optional, List, Dict, Any
 
 
 @dataclass
 class ParsedOrder:
     vendor: str
-    source_file: str
-    pdf_path: str
-
-    purchase_order: Optional[str] = None
     invoice: Optional[str] = None
-    invoice_date: Any = None
+    purchase_order: Optional[str] = None
+    invoice_date: Optional[str] = None  # keep as string; caller may parse
     account_number: Optional[str] = None
-
-    payment_date: Any = None
+    payment_date: Optional[str] = None
     credit_card: Optional[str] = None
-
     merchandise: Optional[float] = None
     shipping: Optional[float] = None
     sales_tax: Optional[float] = None
@@ -27,39 +21,17 @@ class ParsedOrder:
 
 @dataclass
 class ParsedLineItem:
-    vendor: str
-    source_file: str
-    invoice: Optional[str]
-    purchase_order: Optional[str]
-
     line: Optional[int]
-    sku: str
-    description: str
-
-    ordered: Optional[int] = None
-    shipped: Optional[int] = None
-    balance: Optional[int] = None
-
-    unit_price: Optional[float] = None
-    line_total: Optional[float] = None
-
-    # Optional vendor-specific extras
-    manufacturer: Optional[str] = None
-    mfg_part: Optional[str] = None
-    url: Optional[str] = None
+    sku: Optional[str]
+    description: Optional[str]
+    ordered: Optional[int]
+    shipped: Optional[int]
+    balance: Optional[int]
+    unit_price: Optional[float]
+    line_total: Optional[float]
 
 
 class VendorParser(Protocol):
-    """A thin strategy interface: each vendor implements these."""
-
-    vendor: str
-
-    def detect(self, pdf_path: Path) -> bool:
-        """Return True if this parser can handle the PDF."""
-        ...
-
-    def parse_order(self, pdf_path: Path, debug: bool = False) -> ParsedOrder:
-        ...
-
-    def parse_line_items(self, pdf_path: Path, debug: bool = False) -> list[ParsedLineItem]:
-        ...
+    def detect(self, pdf_path: str) -> bool: ...
+    def parse_order(self, pdf_path: str, debug: bool = False) -> Dict[str, Any]: ...
+    def parse_line_items(self, pdf_path: str, debug: bool = False) -> List[Dict[str, Any]]: ...

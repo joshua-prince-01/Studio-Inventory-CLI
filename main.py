@@ -1,12 +1,10 @@
-import os
 import re
 from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
 
-from Read_Line_Items import parse_receipt
-from Read_Order_Details import extract_order_info_by_page
+from vendors.registry import pick_parser
 
 
 # ----------------------------
@@ -79,6 +77,12 @@ def pick_folder_from_cwd(start_dir=None) -> Path:
                 print("Invalid number.")
             continue
 
+        # Allow typing a subfolder name directly
+        candidate = (cur / choice).expanduser().resolve()
+        if candidate.exists() and candidate.is_dir():
+            cur = candidate
+            continue
+
         print("Unrecognized input.")
 
 
@@ -122,7 +126,6 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
             out.append(pdfs[idx])
         return out
 
-    # substring match
     needle = choice
     matches = [p for p in pdfs if needle in p.name.lower()]
     return matches
@@ -157,107 +160,66 @@ def infer_pack_qty(description: str) -> int:
             return 1
     return 1
 
-
-def ingest_mcmaster_receipts(pdf_paths: list[Path], debug: bool = False):
+def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     order_rows = []
     item_rows = []
 
     for pdf_path in pdf_paths:
+        parser = pick_parser(str(pdf_path))
+        if parser is None:
+            if debug:
+                print(f"[WARN] No vendor detected: {pdf_path.name}")
+            continue
+
         if debug:
             print(f"\n=== Processing: {pdf_path.name} ===")
+            print(f"Using parser: {getattr(parser, '__name__', str(parser))}")
 
-        # Order-level info (your module)
-        info = extract_order_info_by_page(str(pdf_path), debug=debug)
-        invoice = info.invoice
-        purchase_order = info.purchase_order
+        info = parser.parse_order(str(pdf_path), debug=debug)
 
+        # ✅ ALWAYS APPEND ORDER ROW HERE
         order_rows.append({
-            "vendor": "mcmaster",
+            "vendor": info.get("vendor"),
             "source_file": pdf_path.name,
             "pdf_path": str(pdf_path),
-
-            "purchase_order": purchase_order,
-            "invoice": invoice,
-            "invoice_date": info.invoice_date,
-            "account_number": info.account_number,
-            "payment_date": info.payment_date,
-            "credit_card": info.credit_card,
-
-            "merchandise": info.merchandise,
-            "shipping": info.shipping,
-            "sales_tax": info.sales_tax,
-            "total": info.total,
+            "purchase_order": info.get("purchase_order"),
+            "invoice": info.get("invoice"),
+            "invoice_date": info.get("invoice_date"),
+            "account_number": info.get("account_number"),
+            "payment_date": info.get("payment_date"),
+            "credit_card": info.get("credit_card"),
+            "merchandise": info.get("merchandise"),
+            "shipping": info.get("shipping"),
+            "sales_tax": info.get("sales_tax"),
+            "total": info.get("total"),
         })
 
-        # Line items (your module)
-        items = parse_receipt(str(pdf_path), page_num=0, debug=debug)
+        items = parser.parse_line_items(str(pdf_path), debug=debug) or []
         for d in items:
             item_rows.append({
-                "vendor": "mcmaster",
+                "vendor": info.get("vendor"),
                 "source_file": pdf_path.name,
-                "invoice": invoice,
-                "purchase_order": purchase_order,
-
+                "invoice": info.get("invoice"),
+                "purchase_order": info.get("purchase_order"),
                 "line": d.get("line"),
                 "sku": d.get("sku"),
+                "part": d.get("part"),
+                "mfg": d.get("mfg"),
+                "mfg_pn": d.get("mfg_pn"),
+                "coo": d.get("coo"),
                 "description": d.get("description"),
                 "ordered": d.get("ordered"),
                 "shipped": d.get("shipped"),
                 "balance": d.get("balance"),
-                "unit_price": d.get("price"),
-                "line_total": d.get("total"),
+                "unit_price": d.get("unit_price"),
+                "line_total": d.get("line_total"),
             })
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
 
-    # Normalize types
-    for col in ["merchandise", "shipping", "sales_tax", "total"]:
-        if col in orders_df.columns:
-            orders_df[col] = orders_df[col].apply(to_float)
-
-    for col in ["line", "ordered", "shipped"]:
-        if col in line_items_df.columns:
-            line_items_df[col] = line_items_df[col].apply(to_int)
-
-    for col in ["unit_price", "line_total"]:
-        if col in line_items_df.columns:
-            line_items_df[col] = line_items_df[col].apply(to_float)
-
-    # Inventory rollup helpers
-    line_items_df["pack_qty"] = line_items_df["description"].apply(infer_pack_qty)
-    line_items_df["units_received"] = (
-        pd.to_numeric(line_items_df["shipped"], errors="coerce").fillna(0).astype(int)
-        * pd.to_numeric(line_items_df["pack_qty"], errors="coerce").fillna(1).astype(int)
-    )
-
-    # Fill missing totals if needed
-    computed_total = (
-        pd.to_numeric(line_items_df["ordered"], errors="coerce")
-        * pd.to_numeric(line_items_df["unit_price"], errors="coerce")
-    )
-    line_items_df["line_total"] = line_items_df["line_total"].fillna(computed_total)
-
-    # Inventory rollup
-    line_items_df["part_key"] = (
-        line_items_df["vendor"].astype(str) + ":" + line_items_df["sku"].astype(str)
-    )
-
-    inventory_df = (
-        line_items_df.groupby("part_key", as_index=False)
-        .agg(
-            vendor=("vendor", "first"),
-            sku=("sku", "first"),
-            description=("description", "first"),
-            units_received=("units_received", "sum"),
-            total_spend=("line_total", "sum"),
-            last_invoice=("invoice", "max"),
-        )
-    )
-    inventory_df["avg_unit_cost"] = inventory_df["total_spend"] / inventory_df["units_received"].replace({0: pd.NA})
-
+    # …keep the rest of your normalization + inventory rollup exactly as you have it…
     return orders_df, line_items_df, inventory_df
-
 
 # ----------------------------
 # MAIN
@@ -267,7 +229,7 @@ def main():
     print("=== Receipt Ingest (CLI) ===")
     print(f"Python sees cwd as: {Path.cwd().resolve()}")
 
-    receipts_folder = pick_folder_from_cwd()   # browse from cwd
+    receipts_folder = pick_folder_from_cwd()
     pdf_paths = pick_pdfs_in_folder(receipts_folder)
 
     if not pdf_paths:
@@ -276,7 +238,7 @@ def main():
 
     debug = (input("\nDebug prints? [y/N]: ").strip().lower() == "y")
 
-    orders_df, line_items_df, inventory_df = ingest_mcmaster_receipts(pdf_paths, debug=debug)
+    orders_df, line_items_df, inventory_df = ingest_receipts(pdf_paths, debug=debug)
 
     print("\n--- ORDERS (head) ---")
     print(orders_df.head(10).to_string(index=False))
@@ -287,10 +249,7 @@ def main():
     print("\n--- INVENTORY (top spend) ---")
     print(inventory_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
 
-    # ----------------------------
     # EXPORT CSVs
-    # ----------------------------
-
     default_export_dir = receipts_folder / "exports"
 
     print("\nExport CSV files")
@@ -307,11 +266,9 @@ def main():
     else:
         export_dir = default_export_dir
 
-    # create folder if missing
     export_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     orders_csv = export_dir / f"orders_{stamp}.csv"
     items_csv = export_dir / f"line_items_{stamp}.csv"
     inv_csv = export_dir / f"inventory_{stamp}.csv"
