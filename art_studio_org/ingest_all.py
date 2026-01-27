@@ -563,14 +563,22 @@ def init_inventory_db(dbfile: Path):
         conn.commit()
 
 
-def update_database(dbfile: Path, orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_received_df: pd.DataFrame):
+def update_database(orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_received_df: pd.DataFrame, parts_removed_df: pd.DataFrame, dbfile: Path):
     init_inventory_db(dbfile)
     with sqlite3.connect(dbfile) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
         _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
         _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
-        _upsert_df(conn, "inventory", parts_received_df, pk_col="part_key")
+        _upsert_df(conn, "parts_received", parts_received_df, pk_col="part_key")
+        _upsert_df(conn, "parts_removed", parts_removed_df, pk_col="removal_uid")
+
+        # Refresh materialized on-hand snapshot from the view (DELETE+INSERT for broad SQLite compatibility)
+        ts = datetime.utcnow().isoformat()
+        conn.execute("DELETE FROM inventory;")
+        conn.execute("INSERT INTO inventory(part_key, on_hand, updated_utc) SELECT part_key, on_hand, ? FROM inventory_view;", (ts,))
+        inventory_on_hand_df = pd.read_sql_query("SELECT * FROM inventory_view;", conn)
         conn.commit()
+    return inventory_on_hand_df
 
 def cli():
     import os

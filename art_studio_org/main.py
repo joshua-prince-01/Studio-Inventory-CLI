@@ -892,14 +892,8 @@ def update_database(
 
         # Refresh materialized on-hand snapshot from the view
         ts = datetime.utcnow().isoformat()
-        conn.execute("""
-            INSERT INTO inventory(part_key, on_hand, updated_utc)
-            SELECT part_key, on_hand, ?
-            FROM inventory_view
-            ON CONFLICT(part_key) DO UPDATE SET
-                on_hand = excluded.on_hand,
-                updated_utc = excluded.updated_utc;
-        """, (ts,))
+        conn.execute("DELETE FROM inventory;")
+        conn.execute("INSERT INTO inventory(part_key, on_hand, updated_utc) SELECT part_key, on_hand, ? FROM inventory_view;", (ts,))
 
         inventory_on_hand_df = pd.read_sql_query("SELECT * FROM inventory_view;", conn)
         conn.commit()
@@ -936,7 +930,7 @@ def main():
         print("\n--- LINE ITEMS (head) ---")
         print(line_items_df.head(15).to_string(index=False))
 
-        print("\n--- INVENTORY (top spend) ---")
+        print("\n--- PARTS RECEIVED (top spend) ---")
         if parts_received_df.empty:
             print("(empty)")
         else:
