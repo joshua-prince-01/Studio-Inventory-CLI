@@ -317,7 +317,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
         line_items_df["part_key"] = line_items_df.apply(_part_key, axis=1)
 
-        inventory_df = (
+        parts_received_df = (
             line_items_df.groupby("part_key", as_index=False)
             .agg(
                 vendor=("vendor", "first"),
@@ -329,11 +329,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
                 last_invoice=("invoice", "max") if "invoice" in line_items_df.columns else ("vendor", "first"),
             )
         )
-        inventory_df["avg_unit_cost"] = inventory_df["total_spend"] / inventory_df["units_received"].replace({0: pd.NA})
+        parts_received_df["avg_unit_cost"] = parts_received_df["total_spend"] / parts_received_df["units_received"].replace({0: pd.NA})
     else:
-        inventory_df = pd.DataFrame(columns=["part_key", "vendor", "sku", "description", "units_received", "total_spend", "last_invoice", "avg_unit_cost"])
+        parts_received_df = pd.DataFrame(columns=["part_key", "vendor", "sku", "description", "units_received", "total_spend", "last_invoice", "avg_unit_cost"])
 
-    return orders_df, line_items_df, inventory_df
+    parts_removed_df = pd.DataFrame(columns=["removal_uid","part_key","qty_removed","ts_utc","project","note"])
+    return orders_df, line_items_df, parts_received_df, parts_removed_df
 
 
 def upsert_master_csv(new_df: pd.DataFrame, master_path: Path, key_cols: list[str]) -> pd.DataFrame:
@@ -369,11 +370,38 @@ def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in rows}
 
 
-def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[str]):
+
+MONEY_COLS = {
+    "subtotal", "shipping", "tax", "total", "balance",
+    "unit_price", "line_total", "total_spend", "avg_unit_cost",
+    "on_hand", "qty_removed", "units_received"
+}
+INT_COLS = {"line", "ordered", "shipped", "pack_qty"}
+
+def _sql_type_for_col(df: pd.DataFrame | None, col: str) -> str:
+    if col in MONEY_COLS:
+        return "REAL"
+    if col in INT_COLS:
+        return "INTEGER"
+    if df is None or col not in df.columns:
+        return "TEXT"
+
+    s = df[col]
+    if pd.api.types.is_integer_dtype(s):
+        return "INTEGER"
+    if pd.api.types.is_float_dtype(s):
+        return "REAL"
+    if pd.api.types.is_bool_dtype(s):
+        return "INTEGER"
+    return "TEXT"
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[str], df: pd.DataFrame | None = None):
     existing = _existing_columns(conn, table)
     for c in cols:
         if c not in existing:
-            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" TEXT;')
+            coltype = _sql_type_for_col(df, c)
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {coltype};')
 
 
 def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: str):
@@ -382,13 +410,13 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: s
 
     _ensure_table(conn, table, pk_col)
     cols = [c for c in df.columns if c]
-    _ensure_columns(conn, table, cols)
+    _ensure_columns(conn, table, cols, df=df)
 
     if "updated_utc" not in cols:
         df = df.copy()
         df["updated_utc"] = datetime.utcnow().isoformat()
         cols = cols + ["updated_utc"]
-        _ensure_columns(conn, table, ["updated_utc"])
+        _ensure_columns(conn, table, ["updated_utc"], df=df)
 
     col_list = ", ".join([f'"{c}"' for c in cols])
     placeholders = ", ".join(["?"] * len(cols))
@@ -405,8 +433,19 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: s
 
 
 def init_inventory_db(dbfile: Path):
+    """
+    Initializes the SQLite schema.
+
+    Naming:
+      - parts_received: aggregated receipts per part_key (what you've brought into the studio)
+      - parts_removed: manual/usage removals (what you've consumed/used)
+      - inventory: materialized current on-hand snapshot (for easy GUI syncing)
+      - inventory_view: SQL view computing on-hand from parts_received - parts_removed
+    """
     dbfile.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(dbfile) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ingested_files (
                 file_hash TEXT PRIMARY KEY,
@@ -417,25 +456,120 @@ def init_inventory_db(dbfile: Path):
             );
         """)
 
-        _ensure_table(conn, "orders", "order_uid")
-        _ensure_table(conn, "line_items", "line_item_uid")
-        _ensure_table(conn, "inventory", "part_key")
+        # Orders + line_items (base schema; extra columns may be added dynamically on upsert)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_uid TEXT PRIMARY KEY,
+                vendor TEXT,
+                order_id TEXT,
+                order_date TEXT,
+                subtotal REAL,
+                shipping REAL,
+                tax REAL,
+                total REAL,
+                balance REAL,
+                file_hash TEXT,
+                updated_utc TEXT
+            );
+        """)
 
-        # Ensure columns needed for indexes exist before creating indexes
-        _ensure_columns(conn, "line_items", ["order_uid"])
-        _ensure_columns(conn, "orders", ["vendor"])
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS line_items (
+                line_item_uid TEXT PRIMARY KEY,
+                order_uid TEXT,
+                vendor TEXT,
+                invoice TEXT,
+                sku TEXT,
+                part_key TEXT,
+                description TEXT,
+                line INTEGER,
+                ordered INTEGER,
+                shipped INTEGER,
+                pack_qty INTEGER,
+                units_received REAL,
+                unit_price REAL,
+                line_total REAL,
+                file_hash TEXT,
+                updated_utc TEXT
+            );
+        """)
 
+        # Aggregated receipts table (what you've received)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS parts_received (
+                part_key TEXT PRIMARY KEY,
+                vendor TEXT,
+                sku TEXT,
+                description TEXT,
+                units_received REAL,
+                total_spend REAL,
+                last_invoice TEXT,
+                avg_unit_cost REAL,
+                updated_utc TEXT
+            );
+        """)
+
+        # Removals/usage table (what you've consumed/used)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS parts_removed (
+                removal_uid TEXT PRIMARY KEY,
+                part_key TEXT NOT NULL,
+                qty_removed REAL NOT NULL,
+                ts_utc TEXT,
+                project TEXT,
+                note TEXT,
+                updated_utc TEXT
+            );
+        """)
+
+        # Materialized on-hand snapshot (easy to sync to external GUIs like Airtable)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inventory (
+                part_key TEXT PRIMARY KEY,
+                on_hand REAL,
+                updated_utc TEXT
+            );
+        """)
+
+        # Indexes
         conn.execute('CREATE INDEX IF NOT EXISTS idx_line_items_order_uid ON line_items(order_uid);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_line_items_part_key ON line_items(part_key);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_parts_removed_part_key ON parts_removed(part_key);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor);')
+
+        # View: computed inventory (received - removed)
+        conn.execute("""
+            CREATE VIEW IF NOT EXISTS inventory_view AS
+            SELECT
+                pr.part_key,
+                pr.vendor,
+                pr.sku,
+                pr.description,
+                pr.units_received,
+                COALESCE(r.removed, 0) AS units_removed,
+                (pr.units_received - COALESCE(r.removed, 0)) AS on_hand,
+                pr.avg_unit_cost,
+                pr.total_spend,
+                pr.last_invoice
+            FROM parts_received pr
+            LEFT JOIN (
+                SELECT part_key, SUM(qty_removed) AS removed
+                FROM parts_removed
+                GROUP BY part_key
+            ) r
+            ON pr.part_key = r.part_key;
+        """)
+
         conn.commit()
 
 
-def update_database(dbfile: Path, orders_df: pd.DataFrame, line_items_df: pd.DataFrame, inventory_df: pd.DataFrame):
+def update_database(dbfile: Path, orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_received_df: pd.DataFrame):
     init_inventory_db(dbfile)
     with sqlite3.connect(dbfile) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
         _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
         _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
-        _upsert_df(conn, "inventory", inventory_df, pk_col="part_key")
+        _upsert_df(conn, "inventory", parts_received_df, pk_col="part_key")
         conn.commit()
 
 def cli():
@@ -450,7 +584,7 @@ def cli():
 
     debug = (input("Debug prints? [y/N]: ").strip().lower() == "y")
 
-    orders_df, line_items_df, inventory_df = ingest_receipts(pdf_paths, debug=debug)
+    orders_df, line_items_df, parts_received_df, parts_removed_df = ingest_receipts(pdf_paths, debug=debug)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_dir = folder / "exports"
@@ -459,7 +593,8 @@ def cli():
     # per-run exports
     orders_df.to_csv(export_dir / f"orders_{stamp}.csv", index=False)
     line_items_df.to_csv(export_dir / f"line_items_{stamp}.csv", index=False)
-    inventory_df.to_csv(export_dir / f"inventory_{stamp}.csv", index=False)
+    parts_received_df.to_csv(export_dir / f"parts_received_{stamp}.csv", index=False)
+    parts_removed_df.to_csv(export_dir / f"parts_removed_{stamp}.csv", index=False)
 
     # master upserts
     orders_master = upsert_master_csv(
@@ -473,9 +608,15 @@ def cli():
         key_cols=["vendor", "invoice", "line", "sku", "source_file"],
     )
 
+    parts_removed_master = upsert_master_csv(
+        parts_removed_df,
+        export_dir / "parts_removed_master.csv",
+        key_cols=["removal_uid"],
+    )
+
     # inventory recompute from master line items (so it stays consistent)
     if not items_master.empty:
-        _, _, inv_master = ingest_receipts([])  # create empty with correct cols
+        _, _, parts_received_master, _ = ingest_receipts([])  # create empty with correct cols
         # quick recompute using the same rollup logic without reparsing PDFs:
         # easiest: reuse the rollup block by calling ingest_receipts on none is messy.
         # Instead, compute here:
@@ -502,7 +643,7 @@ def cli():
 
         items["part_key"] = items.apply(_part_key, axis=1)
 
-        inv_master = (
+        parts_received_master = (
             items.groupby("part_key", as_index=False)
             .agg(
                 vendor=("vendor", "first"),
@@ -514,11 +655,12 @@ def cli():
                 last_invoice=("invoice", "max") if "invoice" in items.columns else ("vendor", "first"),
             )
         )
-        inv_master["avg_unit_cost"] = inv_master["total_spend"] / inv_master["units_received"].replace({0: pd.NA})
-        inv_master.to_csv(export_dir / "inventory_master.csv", index=False)
+        parts_received_master["avg_unit_cost"] = parts_received_master["total_spend"] / parts_received_master["units_received"].replace({0: pd.NA})
+        parts_received_master.to_csv(export_dir / "parts_received_master.csv", index=False)
 
         # Update SQLite DB from master views
-        update_database(dbfile, orders_master, items_master, inv_master)
+        inventory_on_hand_df = update_database(orders_master, items_master, parts_received_master, parts_removed_master, dbfile=dbfile)
+        inventory_on_hand_df.to_csv(export_dir / f"inventory_on_hand_{stamp}.csv", index=False)
 
 
     print("\n✅ Done.")
