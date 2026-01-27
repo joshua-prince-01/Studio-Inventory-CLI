@@ -437,7 +437,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     item_rows: list[dict] = []
 
     # Duplicate detection: persistent across runs + within this run
-    registry = IngestRegistry(project_root() / ".ingest" / "ingest_registry.sqlite")
+    registry = IngestRegistry(db_path())
     seen_hashes: set[str] = set()
 
     def log(msg: str):
@@ -631,6 +631,104 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 # MAIN
 # ----------------------------
 
+# ----------------------------
+# SQLite database (optional) - orders + line_items (+ inventory) + ingested_files registry
+# ----------------------------
+
+def db_path() -> Path:
+    # Single project DB file (auto-created on first run)
+    return project_root() / "studio_inventory.sqlite"
+
+
+def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
+    conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
+
+
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f'PRAGMA table_info("{table}");').fetchall()
+    # PRAGMA columns: cid, name, type, notnull, dflt_value, pk
+    return {r[1] for r in rows}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[str]):
+    existing = _existing_columns(conn, table)
+    for c in cols:
+        if c not in existing:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" TEXT;')
+
+
+def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: str):
+    if df is None or df.empty:
+        return
+
+    _ensure_table(conn, table, pk_col)
+    cols = [c for c in df.columns if c]
+    _ensure_columns(conn, table, cols)
+
+    # Add/update timestamp column
+    if "updated_utc" not in cols:
+        df = df.copy()
+        df["updated_utc"] = datetime.utcnow().isoformat()
+        cols = cols + ["updated_utc"]
+        _ensure_columns(conn, table, ["updated_utc"])
+
+    col_list = ", ".join([f'"{c}"' for c in cols])
+    placeholders = ", ".join(["?"] * len(cols))
+    update_set = ", ".join([f'"{c}"=excluded."{c}"' for c in cols if c != pk_col])
+
+    sql = f"""
+        INSERT INTO "{table}" ({col_list})
+        VALUES ({placeholders})
+        ON CONFLICT("{pk_col}") DO UPDATE SET {update_set};
+    """
+
+    rows = [tuple("" if pd.isna(v) else v for v in r) for r in df[cols].itertuples(index=False, name=None)]
+    conn.executemany(sql, rows)
+
+
+def init_inventory_db(dbfile: Path):
+    dbfile.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(dbfile) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingested_files (
+                file_hash TEXT PRIMARY KEY,
+                first_seen_utc TEXT NOT NULL,
+                original_path TEXT,
+                vendor TEXT,
+                order_id TEXT
+            );
+        """)
+
+        _ensure_table(conn, "orders", "order_uid")
+        _ensure_table(conn, "line_items", "line_item_uid")
+        _ensure_table(conn, "inventory", "part_key")
+
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_line_items_order_uid ON line_items(order_uid);')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor);')
+        conn.commit()
+
+
+def update_database(
+    orders_df: pd.DataFrame,
+    line_items_df: pd.DataFrame,
+    inventory_df: pd.DataFrame,
+    *,
+    dbfile: Path | None = None,
+    logger: RunLogger | None = None
+):
+    dbfile = dbfile or db_path()
+    init_inventory_db(dbfile)
+
+    with sqlite3.connect(dbfile) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
+        _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
+        _upsert_df(conn, "inventory", inventory_df, pk_col="part_key")
+        conn.commit()
+
+    if logger:
+        logger.log(f"SQLite DB updated: {dbfile}")
+
 def main():
     print("=== Receipt Ingest (CLI) ===")
 
@@ -689,6 +787,10 @@ def main():
         logger.log(f"  {orders_csv}")
         logger.log(f"  {items_csv}")
         logger.log(f"  {inv_csv}")
+
+        # Update SQLite database (orders, line_items, inventory)
+        update_database(orders_df, line_items_df, inventory_df, dbfile=db_path(), logger=logger)
+
 
         print("\n✅ CSV files saved:")
         print(" ", orders_csv)

@@ -178,7 +178,8 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     # Persistent registry so re-runs don't re-ingest the same PDF bytes
     project_root = Path(__file__).resolve().parents[1]
-    registry = IngestRegistry(project_root / ".ingest" / "ingest_registry.sqlite")
+    dbfile = project_root / "studio_inventory.sqlite"
+    registry = IngestRegistry(dbfile)
 
     order_rows = []
     item_rows = []
@@ -338,6 +339,84 @@ def upsert_master_csv(new_df: pd.DataFrame, master_path: Path, key_cols: list[st
     return combined
 
 
+# ----------------------------
+# SQLite DB upserts (orders, line_items, inventory)
+# ----------------------------
+
+def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
+    conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
+
+
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f'PRAGMA table_info("{table}");').fetchall()
+    return {r[1] for r in rows}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[str]):
+    existing = _existing_columns(conn, table)
+    for c in cols:
+        if c not in existing:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" TEXT;')
+
+
+def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: str):
+    if df is None or df.empty:
+        return
+
+    _ensure_table(conn, table, pk_col)
+    cols = [c for c in df.columns if c]
+    _ensure_columns(conn, table, cols)
+
+    if "updated_utc" not in cols:
+        df = df.copy()
+        df["updated_utc"] = datetime.utcnow().isoformat()
+        cols = cols + ["updated_utc"]
+        _ensure_columns(conn, table, ["updated_utc"])
+
+    col_list = ", ".join([f'"{c}"' for c in cols])
+    placeholders = ", ".join(["?"] * len(cols))
+    update_set = ", ".join([f'"{c}"=excluded."{c}"' for c in cols if c != pk_col])
+
+    sql = f"""
+        INSERT INTO "{table}" ({col_list})
+        VALUES ({placeholders})
+        ON CONFLICT("{pk_col}") DO UPDATE SET {update_set};
+    """
+
+    rows = [tuple("" if pd.isna(v) else v for v in r) for r in df[cols].itertuples(index=False, name=None)]
+    conn.executemany(sql, rows)
+
+
+def init_inventory_db(dbfile: Path):
+    dbfile.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(dbfile) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingested_files (
+                file_hash TEXT PRIMARY KEY,
+                first_seen_utc TEXT NOT NULL,
+                original_path TEXT,
+                vendor TEXT,
+                order_id TEXT
+            );
+        """)
+
+        _ensure_table(conn, "orders", "order_uid")
+        _ensure_table(conn, "line_items", "line_item_uid")
+        _ensure_table(conn, "inventory", "part_key")
+
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_line_items_order_uid ON line_items(order_uid);')
+        conn.commit()
+
+
+def update_database(dbfile: Path, orders_df: pd.DataFrame, line_items_df: pd.DataFrame, inventory_df: pd.DataFrame):
+    init_inventory_db(dbfile)
+    with sqlite3.connect(dbfile) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
+        _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
+        _upsert_df(conn, "inventory", inventory_df, pk_col="part_key")
+        conn.commit()
+
 def cli():
     import os
 
@@ -416,6 +495,10 @@ def cli():
         )
         inv_master["avg_unit_cost"] = inv_master["total_spend"] / inv_master["units_received"].replace({0: pd.NA})
         inv_master.to_csv(export_dir / "inventory_master.csv", index=False)
+
+        # Update SQLite DB from master views
+        update_database(dbfile, orders_master, items_master, inv_master)
+
 
     print("\n✅ Done.")
     print("Per-run CSVs and master CSVs written to:", export_dir)
