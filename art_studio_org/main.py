@@ -17,7 +17,6 @@ import pandas as pd
 
 from art_studio_org.vendors.registry import pick_parser
 
-
 # ----------------------------
 # Simple run logger
 # ----------------------------
@@ -46,10 +45,8 @@ class RunLogger:
         self.log(f"ERROR: {context}")
         self.log(traceback.format_exc())
 
-
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
-
 
 def create_run_log(echo: bool = True) -> RunLogger:
     root = project_root()
@@ -127,7 +124,6 @@ def pick_folder_from_cwd(start_dir: str | Path | None = None) -> Path:
             continue
 
         print("Unrecognized input.")
-
 
 def pick_pdfs_in_folder(folder: Path) -> list[Path]:
     pdfs = sorted(list(folder.glob("*.pdf")) + list(folder.glob("*.PDF")))
@@ -237,7 +233,6 @@ def _export_browser(start_dir: Path) -> Path | None:
 
         print("Unrecognized input.")
 
-
 def pick_export_folder(default_dir: Path) -> Path | None:
     default_dir = default_dir.expanduser()
     browse_start = default_dir if default_dir.exists() else default_dir.parent
@@ -344,6 +339,7 @@ _NAMESPACE_ORDER = uuid.UUID("0c9d55f5-6920-4e55-92a9-1a9b7b2a7a1a")
 _NAMESPACE_LINEITEM = uuid.UUID("6b6a3d35-7b8c-4b68-8e6a-3d6cf2c3a2a1")
 
 _WS = re.compile(r"\s+")
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     return _WS.sub(" ", s)
@@ -384,8 +380,78 @@ def make_line_item_uid(
     ])
     return str(uuid.uuid5(_NAMESPACE_LINEITEM, key))
 
-
 PACK_RE = re.compile(r"\bPacks?\s+of\s+(\d+)\b", re.I)
+
+_PACK_RE = re.compile(
+    r"""\s*,?\s*(packs?|pack|package|pkg|bag|boxes?)\s+of\s+\d+\s*$""",
+    re.IGNORECASE
+)
+
+def _tighten_units(s: str) -> str:
+    # 24 mm -> 24mm, 3/8" -> 3/8"
+    s = re.sub(r"(\d)\s+(mm|cm|m|in)\b", r"\1\2", s, flags=re.IGNORECASE)
+    # Normalize common diameter terms
+    s = re.sub(r"\bouter diameter\b", "OD", s, flags=re.IGNORECASE)
+    s = re.sub(r"\binner diameter\b", "ID", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bdiameter\b", "Dia", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bthread size\b", "Thread", s, flags=re.IGNORECASE)
+    # Collapse spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def clean_description(desc: str) -> str:
+    if desc is None:
+        return ""
+    s = str(desc).strip()
+    s = _PACK_RE.sub("", s).strip()
+    # also remove trailing ", Each" if it shows up
+    s = re.sub(r"\s*,?\s*each\s*$", "", s, flags=re.IGNORECASE).strip()
+    return s
+
+def make_label_fields(vendor: str, sku: str, description: str, mfg_pn: str | None = None) -> tuple[str, str, str]:
+    """
+    Returns: (desc_clean, label_line1, label_line2)
+    """
+    desc_clean = clean_description(description)
+    if not desc_clean:
+        # fallback to sku/mfg_pn
+        line1 = (mfg_pn or sku or "").strip()
+        return desc_clean, line1, ""
+
+    # McMaster-style comma specs work great for labels
+    parts = [p.strip() for p in desc_clean.split(",") if p.strip()]
+
+    # Prefer first clause as the "name"
+    line1 = parts[0] if parts else desc_clean
+
+    # Build spec line from chunks containing numbers or key spec words
+    spec_candidates = []
+    key_words = ("OD", "ID", "Thread", "Long", "Length", "Wide", "Width", "Thick", "Thickness", "Gauge", "Size", "Pitch", "Dia")
+    for p in parts[1:]:
+        # keep chunks with digits OR key spec words
+        if any(ch.isdigit() for ch in p) or any(k.lower() in p.lower() for k in key_words):
+            # avoid anything pack-related that slipped through
+            if re.search(r"\b(pack|packs|pkg|package)\b", p, flags=re.IGNORECASE):
+                continue
+            spec_candidates.append(_tighten_units(p))
+
+    # If comma parsing didn’t yield anything, try a weaker regex scan
+    if not spec_candidates:
+        # Example: "3/8\"-16 Thread Size" -> pull the "3/8\"-16"
+        m = re.search(r'(\d+\s*/\s*\d+\s*"?\s*-\s*\d+)', desc_clean)
+        if m:
+            spec_candidates.append(_tighten_units(m.group(1)))
+
+    line2 = " - ".join(spec_candidates[:4])  # limit clutter
+
+    # For non-comma vendor descriptions, use a stable identifier on line2 if empty
+    if not line2:
+        if mfg_pn and str(mfg_pn).strip():
+            line2 = str(mfg_pn).strip()
+        elif sku and str(sku).strip():
+            line2 = str(sku).strip()
+
+    return desc_clean, line1, line2
 
 
 def to_int(x):
@@ -397,7 +463,6 @@ def to_int(x):
     except Exception:
         return pd.NA
 
-
 def to_float(x):
     try:
         s = str(x).replace("$", "").replace(",", "").strip()
@@ -406,7 +471,6 @@ def to_float(x):
         return float(s)
     except Exception:
         return pd.NA
-
 
 def infer_pack_qty(description: str) -> int:
     if not description:
@@ -419,7 +483,6 @@ def infer_pack_qty(description: str) -> int:
     except Exception:
         return 1
 
-
 def _dictify(obj) -> dict:
     if obj is None:
         return {}
@@ -430,7 +493,6 @@ def _dictify(obj) -> dict:
     if hasattr(obj, "__dict__"):
         return dict(obj.__dict__)
     return {}
-
 
 def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogger | None = None):
     order_rows: list[dict] = []
@@ -646,7 +708,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     parts_removed_df = pd.DataFrame(columns=["removal_uid","part_key","qty_removed","ts_utc","project","note"])
     return orders_df, line_items_df, parts_received_df, parts_removed_df
 
-
 # ----------------------------
 # MAIN
 # ----------------------------
@@ -659,17 +720,13 @@ def db_path() -> Path:
     # Single project DB file (auto-created on first run)
     return project_root() / "studio_inventory.sqlite"
 
-
 def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
-
 
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f'PRAGMA table_info("{table}");').fetchall()
     # PRAGMA columns: cid, name, type, notnull, dflt_value, pk
     return {r[1] for r in rows}
-
-
 
 MONEY_COLS = {
     "subtotal", "shipping", "tax", "total", "balance",
@@ -695,14 +752,12 @@ def _sql_type_for_col(df: pd.DataFrame | None, col: str) -> str:
         return "INTEGER"
     return "TEXT"
 
-
 def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[str], df: pd.DataFrame | None = None):
     existing = _existing_columns(conn, table)
     for c in cols:
         if c not in existing:
             coltype = _sql_type_for_col(df, c)
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {coltype};')
-
 
 def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: str):
     if df is None or df.empty:
@@ -731,7 +786,6 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: s
 
     rows = [tuple(None if pd.isna(v) else v for v in r) for r in df[cols].itertuples(index=False, name=None)]
     conn.executemany(sql, rows)
-
 
 def init_inventory_db(dbfile: Path):
     """
@@ -863,7 +917,6 @@ def init_inventory_db(dbfile: Path):
 
         conn.commit()
 
-
 def update_database(
     orders_df: pd.DataFrame,
     line_items_df: pd.DataFrame,
@@ -902,7 +955,6 @@ def update_database(
         logger.log(f"SQLite DB updated: {dbfile}")
 
     return inventory_on_hand_df
-
 
 def main():
     print("=== Receipt Ingest (CLI) ===")
@@ -989,7 +1041,6 @@ def main():
 
     finally:
         logger.close()
-
 
 if __name__ == "__main__":
     main()

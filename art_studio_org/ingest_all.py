@@ -116,6 +116,78 @@ def make_order_uid(vendor: str, order_id: str, file_hash: str) -> str:
     return str(uuid.uuid5(NAMESPACE_ORDER, key))
 
 
+
+_PACK_RE = re.compile(
+    r"""\s*,?\s*(packs?|pack|package|pkg|bag|boxes?)\s+of\s+\d+\s*$""",
+    re.IGNORECASE
+)
+
+def _tighten_units(s: str) -> str:
+    # 24 mm -> 24mm, 3/8" -> 3/8"
+    s = re.sub(r"(\d)\s+(mm|cm|m|in)\b", r"\1\2", s, flags=re.IGNORECASE)
+    # Normalize common diameter terms
+    s = re.sub(r"\bouter diameter\b", "OD", s, flags=re.IGNORECASE)
+    s = re.sub(r"\binner diameter\b", "ID", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bdiameter\b", "Dia", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bthread size\b", "Thread", s, flags=re.IGNORECASE)
+    # Collapse spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def clean_description(desc: str) -> str:
+    if desc is None:
+        return ""
+    s = str(desc).strip()
+    s = _PACK_RE.sub("", s).strip()
+    # also remove trailing ", Each" if it shows up
+    s = re.sub(r"\s*,?\s*each\s*$", "", s, flags=re.IGNORECASE).strip()
+    return s
+
+def make_label_fields(vendor: str, sku: str, description: str, mfg_pn: str | None = None) -> tuple[str, str, str]:
+    """
+    Returns: (desc_clean, label_line1, label_line2)
+    """
+    desc_clean = clean_description(description)
+    if not desc_clean:
+        # fallback to sku/mfg_pn
+        line1 = (mfg_pn or sku or "").strip()
+        return desc_clean, line1, ""
+
+    # McMaster-style comma specs work great for labels
+    parts = [p.strip() for p in desc_clean.split(",") if p.strip()]
+
+    # Prefer first clause as the "name"
+    line1 = parts[0] if parts else desc_clean
+
+    # Build spec line from chunks containing numbers or key spec words
+    spec_candidates = []
+    key_words = ("OD", "ID", "Thread", "Long", "Length", "Wide", "Width", "Thick", "Thickness", "Gauge", "Size", "Pitch", "Dia")
+    for p in parts[1:]:
+        # keep chunks with digits OR key spec words
+        if any(ch.isdigit() for ch in p) or any(k.lower() in p.lower() for k in key_words):
+            # avoid anything pack-related that slipped through
+            if re.search(r"\b(pack|packs|pkg|package)\b", p, flags=re.IGNORECASE):
+                continue
+            spec_candidates.append(_tighten_units(p))
+
+    # If comma parsing didn’t yield anything, try a weaker regex scan
+    if not spec_candidates:
+        # Example: "3/8\"-16 Thread Size" -> pull the "3/8\"-16"
+        m = re.search(r'(\d+\s*/\s*\d+\s*"?\s*-\s*\d+)', desc_clean)
+        if m:
+            spec_candidates.append(_tighten_units(m.group(1)))
+
+    line2 = " - ".join(spec_candidates[:4])  # limit clutter
+
+    # For non-comma vendor descriptions, use a stable identifier on line2 if empty
+    if not line2:
+        if mfg_pn and str(mfg_pn).strip():
+            line2 = str(mfg_pn).strip()
+        elif sku and str(sku).strip():
+            line2 = str(sku).strip()
+
+    return desc_clean, line1, line2
+
 def make_line_item_uid(
     *,
     vendor: str,
@@ -252,6 +324,20 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
+
+    # Add label fields for all vendors
+    def _row_label(r):
+        desc_clean, l1, l2 = make_label_fields(
+            vendor=str(r.get("vendor", "") or ""),
+            sku=str(r.get("sku", "") or ""),
+            description=str(r.get("description", "") or ""),
+            mfg_pn=(None if "mfg_pn" not in r else r.get("mfg_pn"))
+        )
+        return desc_clean, l1, l2
+
+    labels = line_items_df.apply(_row_label, axis=1, result_type="expand")
+    labels.columns = ["desc_clean", "label_line1", "label_line2"]
+    line_items_df = line_items_df.join(labels)
 
     # Normalize numeric types (keep vendor-specific extra cols intact)
     for col in ["merchandise", "shipping", "sales_tax", "total"]:
