@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from . import arduino, digikey, mcmaster
+from . import stepperonline, arduino, digikey, mcmaster
 
 # Order matters: more-specific detectors first if needed
 PARSERS = [
+    stepperonline,
     arduino,
     digikey,
     mcmaster,
