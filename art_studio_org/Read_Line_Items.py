@@ -3,6 +3,7 @@ import re
 import pdfplumber
 
 LINE_ITEM_RE = re.compile(r"^\s*(\d+)\s+([A-Z0-9]+)\s*(.*)$", re.I)
+SKU_RE = re.compile(r"^\d{4,6}[A-Z]\d{1,4}$")
 
 def group_words_into_lines(words, y_tol=2):
     words = sorted(words, key=lambda w: (w["top"], w["x0"]))
@@ -113,7 +114,7 @@ def parse_receipt(pdf_path, page_num=0, debug=True):
             text = row["text"]
             m = LINE_ITEM_RE.match(text)
 
-            if m:
+            if m and SKU_RE.match(m.group(2)):
                 line_no = int(m.group(1))
                 sku = m.group(2)
                 desc = (m.group(3) or "").strip()
@@ -156,8 +157,8 @@ def parse_receipt(pdf_path, page_num=0, debug=True):
         return items
 
 if __name__ == "__main__":
-    base = os.path.expanduser("/")
-    receipts_dir = os.path.join(base, "../not_in_use/McMaster_Items", "receipts")
+    base = os.path.expanduser("~/PycharmProjects/PythonProject_studio_inventory")
+    receipts_dir = os.path.join(base, "McMaster_Items", "receipts")
 
     pdfs = sorted(f for f in os.listdir(receipts_dir) if f.lower().endswith(".pdf"))
     if not pdfs:
