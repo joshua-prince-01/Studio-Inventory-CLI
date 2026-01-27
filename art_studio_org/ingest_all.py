@@ -266,6 +266,23 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         if col in line_items_df.columns:
             line_items_df[col] = line_items_df[col].apply(to_float)
 
+
+    # Ensure unit_price is never NULL when we have line_total.
+    # Prefer line_total / ordered when ordered is numeric and > 0; otherwise fall back to line_total.
+    if "unit_price" in line_items_df.columns and "line_total" in line_items_df.columns:
+        up = line_items_df["unit_price"]
+        lt = line_items_df["line_total"]
+        need = up.isna() & lt.notna()
+        if need.any():
+            if "ordered" in line_items_df.columns:
+                ord_ = pd.to_numeric(line_items_df["ordered"], errors="coerce")
+                div_ok = need & ord_.notna() & (ord_ > 0)
+                line_items_df.loc[div_ok, "unit_price"] = (lt[div_ok] / ord_[div_ok]).astype(float)
+                need2 = line_items_df["unit_price"].isna() & lt.notna()
+                line_items_df.loc[need2, "unit_price"] = lt[need2].astype(float)
+            else:
+                line_items_df.loc[need, "unit_price"] = lt[need].astype(float)
+
     # Inventory rollup helpers
     if not line_items_df.empty:
         if "description" in line_items_df.columns:
@@ -383,7 +400,7 @@ def _upsert_df(conn: sqlite3.Connection, table: str, df: pd.DataFrame, pk_col: s
         ON CONFLICT("{pk_col}") DO UPDATE SET {update_set};
     """
 
-    rows = [tuple("" if pd.isna(v) else v for v in r) for r in df[cols].itertuples(index=False, name=None)]
+    rows = [tuple(None if pd.isna(v) else v for v in r) for r in df[cols].itertuples(index=False, name=None)]
     conn.executemany(sql, rows)
 
 

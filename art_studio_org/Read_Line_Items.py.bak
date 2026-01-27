@@ -63,34 +63,6 @@ def find_stop_line(words, y_tol=2):
             return ln
     return None
 
-
-def _to_int(s):
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "" or ss.lower() in {"none", "nan", "null", "-"}:
-            return None
-        # some PDFs yield '1 0' or similar; take last token
-        ss = ss.split()[-1]
-        return int(float(ss))
-    except Exception:
-        return None
-
-def _to_float_money(s):
-    if s is None:
-        return None
-    try:
-        ss = str(s).strip()
-        if ss == "" or ss.lower() in {"none", "nan", "null", "-"}:
-            return None
-        # keep last token if noise
-        ss = ss.split()[-1]
-        ss = ss.replace("$", "").replace(",", "")
-        return float(ss)
-    except Exception:
-        return None
-
 _moneyish = re.compile(r"^\$?\d+(?:,\d{3})*(?:\.\d{2})?$")
 
 def parse_receipt(pdf_path, page_num=0, debug=True):
@@ -167,11 +139,11 @@ def parse_receipt(pdf_path, page_num=0, debug=True):
                     "line": line_no,
                     "sku": sku,
                     "description": desc,
-                    "ordered": _to_int(ordered),
-                    "shipped": _to_int(shipped),
-                    "balance": _to_int(balance),
-                    "price": _to_float_money(price),
-                    "total": _to_float_money(total),
+                    "ordered": ordered,
+                    "shipped": shipped,
+                    "balance": balance,
+                    "price": price,
+                    "total": total,
                 }
                 items.append(current)
             else:

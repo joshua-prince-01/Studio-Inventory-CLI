@@ -703,6 +703,10 @@ def init_inventory_db(dbfile: Path):
         _ensure_table(conn, "line_items", "line_item_uid")
         _ensure_table(conn, "inventory", "part_key")
 
+        # Ensure columns needed for indexes exist before creating indexes
+        _ensure_columns(conn, "line_items", ["order_uid"])
+        _ensure_columns(conn, "orders", ["vendor"])
+
         conn.execute('CREATE INDEX IF NOT EXISTS idx_line_items_order_uid ON line_items(order_uid);')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor);')
         conn.commit()
