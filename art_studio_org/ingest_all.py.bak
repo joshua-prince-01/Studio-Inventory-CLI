@@ -4,11 +4,6 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-import hashlib
-import shutil
-import sqlite3
-import uuid
-
 import pandas as pd
 
 from vendors.registry import pick_parser
@@ -17,127 +12,6 @@ from vendors.registry import pick_parser
 # ----------------------------
 # Shared helpers
 # ----------------------------
-
-# ----------------------------
-# Duplicate detection + stable IDs
-# ----------------------------
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-class IngestRegistry:
-    """Tracks ingested PDFs by content hash so re-runs can skip duplicates."""
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self):
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self):
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ingested_files (
-                    file_hash TEXT PRIMARY KEY,
-                    first_seen_utc TEXT NOT NULL,
-                    original_path TEXT,
-                    vendor TEXT,
-                    order_id TEXT
-                );
-                """
-            )
-            conn.commit()
-
-    def has_hash(self, file_hash: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM ingested_files WHERE file_hash = ? LIMIT 1;",
-                (file_hash,),
-            ).fetchone()
-        return row is not None
-
-    def register(self, file_hash: str, pdf_path: Path, vendor: str | None = None, order_id: str | None = None):
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO ingested_files(file_hash, first_seen_utc, original_path, vendor, order_id) "
-                "VALUES (?, ?, ?, ?, ?);",
-                (file_hash, datetime.utcnow().isoformat(), str(pdf_path), vendor, order_id),
-            )
-            conn.commit()
-
-
-def move_to_duplicates(pdf_path: Path) -> Path:
-    duplicates_dir = pdf_path.parent / "duplicates"
-    duplicates_dir.mkdir(parents=True, exist_ok=True)
-
-    dest = duplicates_dir / pdf_path.name
-    if dest.exists():
-        stem, suffix = pdf_path.stem, pdf_path.suffix
-        i = 2
-        while True:
-            candidate = duplicates_dir / f"{stem}__dup{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-
-    return Path(shutil.move(str(pdf_path), str(dest)))
-
-
-_WS = re.compile(r"\s+")
-
-def _norm(s: object) -> str:
-    s = "" if s is None or (isinstance(s, float) and pd.isna(s)) else str(s)
-    return _WS.sub(" ", s.strip().lower())
-
-
-NAMESPACE_LINEITEM = uuid.UUID("6b6a3d35-7b8c-4b68-8e6a-3d6cf2c3a2a1")
-NAMESPACE_ORDER = uuid.UUID("c2a3b7d1-2df7-46c0-8de8-8d0d0c2a4f17")
-
-
-def _first_nonempty(obj, names: tuple[str, ...], default: str = "") -> str:
-    for n in names:
-        if hasattr(obj, n):
-            v = getattr(obj, n)
-            if v is not None and str(v).strip() != "":
-                return str(v)
-    return default
-
-
-def make_order_uid(vendor: str, order_id: str, file_hash: str) -> str:
-    key = "|".join([_norm(vendor), _norm(order_id), file_hash])
-    return str(uuid.uuid5(NAMESPACE_ORDER, key))
-
-
-def make_line_item_uid(
-    *,
-    vendor: str,
-    order_id: str,
-    file_hash: str,
-    line_index: int,
-    part_number: str = "",
-    description: str = "",
-    unit_price: str = "",
-    quantity: str = "",
-) -> str:
-    key = "|".join([
-        _norm(vendor),
-        _norm(order_id),
-        file_hash,
-        str(line_index),
-        _norm(part_number),
-        _norm(description),
-        _norm(unit_price),
-        _norm(quantity),
-    ])
-    return str(uuid.uuid5(NAMESPACE_LINEITEM, key))
 
 PACK_RE = re.compile(r"\bPacks?\s+of\s+(\d+)\b", re.I)
 
@@ -176,78 +50,25 @@ def infer_pack_qty(description: str) -> int:
 def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """Parse a mixed set of vendor PDFs into orders, line_items, and inventory rollups."""
 
-    # Persistent registry so re-runs don't re-ingest the same PDF bytes
-    project_root = Path(__file__).resolve().parents[1]
-    registry = IngestRegistry(project_root / ".ingest" / "ingest_registry.sqlite")
-
     order_rows = []
     item_rows = []
 
-    # Also avoid duplicates within the same selection (before the registry is updated)
-    seen_hashes: set[str] = set()
-
     for pdf_path in pdf_paths:
-        pdf_path = Path(pdf_path)
-
         parser = pick_parser(pdf_path)
         if parser is None:
             print(f"⚠️  No parser matched: {pdf_path.name} (skipping)")
             continue
 
-        file_hash = sha256_file(pdf_path)
-
-        if (file_hash in seen_hashes) or registry.has_hash(file_hash):
-            moved = move_to_duplicates(pdf_path)
-            print(f"🟡 DUPLICATE skipped: {pdf_path.name} → {moved.name}")
-            continue
-        seen_hashes.add(file_hash)
-
         if debug:
-            print(f"\\n=== {parser.vendor.upper()} :: {pdf_path.name} ===")
+            print(f"\n=== {parser.vendor.upper()} :: {pdf_path.name} ===")
 
-        try:
-            order = parser.parse_order(pdf_path, debug=debug)
-            items = parser.parse_line_items(pdf_path, debug=debug)
-        except Exception as e:
-            print(f"❌ Parse failed: {pdf_path.name} ({e})")
-            continue
+        order = parser.parse_order(pdf_path, debug=debug)
+        items = parser.parse_line_items(pdf_path, debug=debug)
 
-        vendor = getattr(parser, "vendor", None) or _first_nonempty(order, ("vendor",), default="unknown") or "unknown"
-        order_id = _first_nonempty(order, ("order_id", "order", "invoice", "invoice_no", "id", "number"), default="unknown")
+        order_rows.append(order.__dict__)
 
-        order_uid = make_order_uid(vendor, order_id, file_hash)
-
-        od = dict(order.__dict__)
-        od["file_hash"] = file_hash
-        od["order_uid"] = order_uid
-        order_rows.append(od)
-
-        for i, it in enumerate(items):
-            d = dict(it.__dict__)
-            d.setdefault("vendor", vendor)
-            d.setdefault("order_id", order_id)
-            d["file_hash"] = file_hash
-            d["order_uid"] = order_uid
-
-            part_number = d.get("part_number") or d.get("sku") or d.get("mfg_part") or ""
-            description = d.get("description") or ""
-            unit_price = d.get("unit_price") or d.get("price") or ""
-            quantity = d.get("ordered") or d.get("quantity") or d.get("qty") or d.get("shipped") or ""
-
-            d["line_item_uid"] = make_line_item_uid(
-                vendor=vendor,
-                order_id=order_id,
-                file_hash=file_hash,
-                line_index=i,
-                part_number=str(part_number),
-                description=str(description),
-                unit_price=str(unit_price),
-                quantity=str(quantity),
-            )
-            item_rows.append(d)
-
-        # Register only after successful parse (so failures aren't marked as ingested)
-        registry.register(file_hash, pdf_path, vendor=vendor, order_id=order_id)
+        for it in items:
+            item_rows.append(it.__dict__)
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)

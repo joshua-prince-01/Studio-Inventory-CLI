@@ -9,10 +9,6 @@ from datetime import datetime
 from pathlib import Path
 import re
 import traceback
-import hashlib
-import shutil
-import sqlite3
-import uuid
 import pandas as pd
 
 from art_studio_org.vendors.registry import pick_parser
@@ -266,125 +262,6 @@ def pick_export_folder(default_dir: Path) -> Path | None:
 # Ingest helpers + normalization
 # ----------------------------
 
-# ----------------------------
-# Ingest integrity: duplicate detection + stable IDs
-# ----------------------------
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-class IngestRegistry:
-    """
-    Persistent registry of ingested PDFs (by content hash), so we can skip duplicates across runs.
-    Stored in a local SQLite DB under project_root/.ingest/
-    """
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _connect(self):
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self):
-        with self._connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ingested_files (
-                    file_hash TEXT PRIMARY KEY,
-                    first_seen_utc TEXT NOT NULL,
-                    original_path TEXT,
-                    vendor TEXT,
-                    order_ref TEXT
-                );
-            """)
-            conn.commit()
-
-    def has_hash(self, file_hash: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM ingested_files WHERE file_hash = ? LIMIT 1;",
-                (file_hash,)
-            ).fetchone()
-        return row is not None
-
-    def register(self, *, file_hash: str, pdf_path: Path, vendor: str | None = None, order_ref: str | None = None):
-        with self._connect() as conn:
-            conn.execute("""
-                INSERT OR IGNORE INTO ingested_files(file_hash, first_seen_utc, original_path, vendor, order_ref)
-                VALUES (?, ?, ?, ?, ?);
-            """, (file_hash, datetime.utcnow().isoformat(), str(pdf_path), vendor, order_ref))
-            conn.commit()
-
-
-def move_to_duplicates(pdf_path: Path, duplicates_dir: Path) -> Path:
-    """
-    Move pdf_path into duplicates_dir, de-conflicting filename if needed.
-    Returns the new path.
-    """
-    duplicates_dir.mkdir(parents=True, exist_ok=True)
-    dest = duplicates_dir / pdf_path.name
-    if dest.exists():
-        stem, suffix = pdf_path.stem, pdf_path.suffix
-        i = 2
-        while True:
-            candidate = duplicates_dir / f"{stem}__dup{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-    return Path(shutil.move(str(pdf_path), str(dest)))
-
-
-_NAMESPACE_ORDER = uuid.UUID("0c9d55f5-6920-4e55-92a9-1a9b7b2a7a1a")
-_NAMESPACE_LINEITEM = uuid.UUID("6b6a3d35-7b8c-4b68-8e6a-3d6cf2c3a2a1")
-
-_WS = re.compile(r"\s+")
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    return _WS.sub(" ", s)
-
-
-def make_order_uid(*, vendor: str, order_ref: str, file_hash: str) -> str:
-    """
-    Stable-ish order ID.
-    If you want it stable across multiple PDFs for the "same order", change the key to exclude file_hash.
-    """
-    key = "|".join([_norm(vendor), _norm(order_ref), file_hash])
-    return str(uuid.uuid5(_NAMESPACE_ORDER, key))
-
-
-def make_line_item_uid(
-    *,
-    vendor: str,
-    order_ref: str,
-    file_hash: str,
-    line_index: int,
-    sku: str = "",
-    description: str = "",
-    unit_price: str = "",
-    ordered: str = "",
-) -> str:
-    """
-    Deterministic line-item ID for linked databases.
-    """
-    key = "|".join([
-        _norm(vendor),
-        _norm(order_ref),
-        file_hash,            # tie to exact source PDF content
-        str(line_index),
-        _norm(sku),
-        _norm(description),
-        _norm(str(unit_price)),
-        _norm(str(ordered)),
-    ])
-    return str(uuid.uuid5(_NAMESPACE_LINEITEM, key))
-
-
 PACK_RE = re.compile(r"\bPacks?\s+of\s+(\d+)\b", re.I)
 
 
@@ -436,10 +313,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     order_rows: list[dict] = []
     item_rows: list[dict] = []
 
-    # Duplicate detection: persistent across runs + within this run
-    registry = IngestRegistry(project_root() / ".ingest" / "ingest_registry.sqlite")
-    seen_hashes: set[str] = set()
-
     def log(msg: str):
         if logger:
             logger.log(msg)
@@ -447,31 +320,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             print(msg)
 
     for pdf_path in pdf_paths:
-        pdf_path = Path(pdf_path)
-
-        # Hash the file first so we can skip/move duplicates before any parsing work
-        try:
-            file_hash = sha256_file(pdf_path)
-        except Exception:
-            log(f"  RESULT: SKIPPED (could not hash file: {pdf_path})\n")
-            continue
-
-        dup_reason = None
-        if file_hash in seen_hashes:
-            dup_reason = "duplicate in selected batch"
-        elif registry.has_hash(file_hash):
-            dup_reason = "already ingested"
-
-        if dup_reason:
-            try:
-                moved = move_to_duplicates(pdf_path, pdf_path.parent / "duplicates")
-                log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
-            except Exception:
-                log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {pdf_path}\n")
-            continue
-
-        seen_hashes.add(file_hash)
-
         parser = pick_parser(str(pdf_path))
         parser_name = getattr(parser, "__name__", None) if parser else "(none)"
 
@@ -491,12 +339,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
             vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
 
-            order_ref = str(info.get("invoice") or info.get("purchase_order") or "")
-            order_uid = make_order_uid(vendor=vendor, order_ref=order_ref, file_hash=file_hash)
-
             order_rows.append({
-                "order_uid": order_uid,
-                "file_hash": file_hash,
                 "vendor": vendor,
                 "source_file": pdf_path.name,
                 "pdf_path": str(pdf_path),
@@ -516,31 +359,13 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
             log(f"  LINE_ITEMS: {len(items)} parsed")
 
-            for idx, d in enumerate(items, start=1):
-                line_idx = d.get("line")
-                if line_idx is None:
-                    line_idx = idx
-
-                line_item_uid = make_line_item_uid(
-                    vendor=vendor,
-                    order_ref=order_ref,
-                    file_hash=file_hash,
-                    line_index=int(line_idx),
-                    sku=str(d.get("sku") or ""),
-                    description=str(d.get("description") or ""),
-                    unit_price=str(d.get("unit_price") or ""),
-                    ordered=str(d.get("ordered") or ""),
-                )
-
+            for d in items:
                 row = {
-                    "line_item_uid": line_item_uid,
-                    "order_uid": order_uid,
-                    "file_hash": file_hash,
                     "vendor": vendor,
                     "source_file": pdf_path.name,
                     "invoice": info.get("invoice"),
                     "purchase_order": info.get("purchase_order"),
-                    "line": line_idx,
+                    "line": d.get("line"),
                     "sku": d.get("sku"),
                     "description": d.get("description"),
                     "ordered": d.get("ordered"),
@@ -553,9 +378,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                     if k in d and k not in row:
                         row[k] = d.get(k)
                 item_rows.append(row)
-
-            # Mark this PDF as ingested only after successful parse
-            registry.register(file_hash=file_hash, pdf_path=pdf_path, vendor=vendor, order_ref=order_ref)
 
             log("  RESULT: OK\n")
 
