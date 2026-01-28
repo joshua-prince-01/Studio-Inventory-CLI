@@ -117,11 +117,12 @@ def make_labels_pdf(
 
         # Choose what to print (simple + reliable)
         line1 = (item.get("label_line1") or item.get("label_short") or item.get("part_key") or "").strip()
-        line2 = (item.get("label_line2") or item.get("vendor_sku") or item.get("sku") or "").strip()
-        line3 = (item.get("purchase_url") or "").strip()
+        line2 = (item.get("label_line2") or f'{item.get("vendor", "")}:{item.get("sku", "")}' or "").strip()
 
-        # QR uses label_qr_text if present, else purchase_url, else part_key
-        qr_text = (item.get("label_qr_text") or line3 or item.get("part_key") or "").strip()
+        # Do NOT print URL text line at all
+        line3 = ""
+
+        qr_text = (item.get("label_qr_text") or item.get("purchase_url") or item.get("part_key") or "").strip()
 
         # Layout: 2–3 lines left, optional QR right
         text_left_w = w
@@ -134,7 +135,7 @@ def make_labels_pdf(
         cur_y = y + h - t.font_size
         for s in [line1, line2]:
             if s:
-                c.drawString(x, cur_y, s[:70])
+                c.drawString(x, cur_y, s[:22])
                 cur_y -= (t.font_size + 1)
 
         if line3:

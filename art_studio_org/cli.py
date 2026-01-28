@@ -62,6 +62,34 @@ def timestamp_slug() -> str:
     # local time is fine for filenames
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def list_label_templates() -> list[Path]:
+    d = project_root() / "label_templates"
+    if not d.exists():
+        return []
+    return sorted(d.glob("*.json"))
+
+def pick_label_template() -> Path | None:
+    templates = list_label_templates()
+    if not templates:
+        console.print("[red]No templates found in label_templates/*.json[/red]")
+        pause()
+        return None
+
+    console.print("[bold]Choose template[/bold]\n")
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("#", justify="right", width=3)
+    t.add_column("file")
+    for i, p in enumerate(templates, 1):
+        t.add_row(str(i), p.name)
+    console.print(t)
+
+    choice = IntPrompt.ask("Template #", default=1)
+    if not (1 <= choice <= len(templates)):
+        console.print("[red]Invalid choice[/red]")
+        pause()
+        return None
+
+    return templates[choice - 1]
 
 # ----------------------------
 # Legacy ingest runner (subprocess)
@@ -892,19 +920,9 @@ def labels_make_pdf(db: DB):
     header()
     console.print("[bold]Make labels PDF[/bold]\n")
 
-    # template
-    default_tpl = "label_templates/avery_94102.json"
-    tpl = Prompt.ask("Template file", default=default_tpl).strip()
-
-    if tpl in ("", "."):
-        tpl = default_tpl
-    if "/" not in tpl:
-        tpl = f"label_templates/{tpl}"
-
-    tpl_path = (project_root() / tpl).resolve()
-    if not tpl_path.exists():
-        console.print(f"[red]Template not found:[/red] {tpl_path}")
-        pause()
+    # template (pick from list)
+    tpl_path = pick_label_template()
+    if not tpl_path:
         return
 
     # choose items
