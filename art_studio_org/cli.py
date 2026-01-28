@@ -17,6 +17,7 @@ from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
 from art_studio_org.db import DB, default_db_path, project_root
+from art_studio_org.vendors.mcmaster_api import McMasterClient, McMasterCreds
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -796,10 +797,71 @@ def menu_db_diagnostics():
 # Future stubs
 # ----------------------------
 def menu_vendors():
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Vendors[/bold]\n")
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "McMaster – enrich ONE part")
+        menu.add_row("2.", "McMaster – enrich missing (later)")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "2", "0"], default="1")
+        if choice == "0":
+            return
+        if choice == "1":
+            vendor_mcmaster_enrich_one()
+
+
+def vendor_mcmaster_enrich_one():
     console.clear()
     header()
-    console.print("[bold]Vendors[/bold]\n")
-    console.print("Next: DigiKey OAuth + product/media enrichment, then McMaster cert-based API enrichment.")
+    console.print("[bold]McMaster enrich ONE[/bold]\n")
+
+    part_key = Prompt.ask("part_key (mcmaster:1234K56)").strip()
+    if not part_key.startswith("mcmaster:"):
+        console.print("[red]part_key must start with mcmaster:[/red]")
+        pause()
+        return
+
+    sku = part_key.split(":", 1)[1]
+    db = get_db()
+
+    try:
+        client = McMasterClient(McMasterCreds.from_env())
+        client.add_product(sku)
+        info = client.product_info(sku)
+
+        title = info.get("Title")
+        desc = info.get("Description")
+        url = info.get("ProductUrl")
+
+        image_url = None
+        for link in info.get("Links", []):
+            if link.get("Rel") == "Image":
+                image_url = link.get("Href")
+
+        specs = info.get("Specifications")
+
+        db.upsert_vendor_enrichment(
+            part_key=part_key,
+            vendor="mcmaster",
+            sku=sku,
+            source="mcmaster",
+            title=title,
+            description=desc,
+            product_url=url,
+            image_url=image_url,
+            specs_json=specs,
+            raw_json=info,
+        )
+
+        console.print("[green]Enriched and saved to vendor_enrichment.[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed:[/red] {e}")
+
     pause()
 
 

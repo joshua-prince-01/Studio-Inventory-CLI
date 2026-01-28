@@ -14,6 +14,51 @@ def project_root() -> Path:
 def default_db_path() -> Path:
     return project_root() / "studio_inventory.sqlite"
 
+def upsert_vendor_enrichment(
+    self,
+    *,
+    part_key: str,
+    vendor: str,
+    sku: str,
+    source: str,
+    title: str | None,
+    description: str | None,
+    product_url: str | None,
+    image_url: str | None,
+    specs_json: dict | None,
+    raw_json: dict,
+):
+    self.execute(
+        """
+        INSERT INTO vendor_enrichment (
+            part_key, vendor, sku, source,
+            title, description, product_url, image_url,
+            specs_json, raw_json, fetched_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(part_key) DO UPDATE SET
+            title=excluded.title,
+            description=excluded.description,
+            product_url=excluded.product_url,
+            image_url=excluded.image_url,
+            specs_json=excluded.specs_json,
+            raw_json=excluded.raw_json,
+            fetched_utc=excluded.fetched_utc
+        """,
+        [
+            part_key,
+            vendor,
+            sku,
+            source,
+            title,
+            description,
+            product_url,
+            image_url,
+            json.dumps(specs_json) if specs_json else None,
+            json.dumps(raw_json),
+            utc_now_iso(),
+        ],
+    )
 
 @dataclass
 class DB:

@@ -8,5 +8,8 @@ dependencies = [
     "numpy>=2.4.1",
     "pandas>=3.0.0",
     "pdfplumber>=0.11.9",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+    "requests-pkcs12>=1.27",
     "typer>=0.21.1",
 ]
