@@ -517,10 +517,10 @@ def inv_show(db: DB, part_key: str | None = None):
     header()
     console.print("[bold]Show inventory item[/bold]\n")
 
+    # Only prompt if caller didn't supply a part_key
     if part_key is None:
-        part_key = Prompt.ask("part_key").strip()
+        part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
 
-    part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
     if not part_key:
         return
 
@@ -554,9 +554,15 @@ def inv_show(db: DB, part_key: str | None = None):
         rt.add_column("project", width=18)
         rt.add_column("note")
         for rr in rem:
-            rt.add_row(safe_str(rr["ts_utc"]), safe_str(rr["qty_removed"]), shorten(rr["project"], 18), shorten(rr["note"], 60))
+            rt.add_row(
+                safe_str(rr["ts_utc"]),
+                safe_str(rr["qty_removed"]),
+                shorten(rr["project"], 18),
+                shorten(rr["note"], 60),
+            )
         console.print(rt)
 
+    # "Click out" back to browse
     Prompt.ask("\nPress Enter to go back", default="")
     return
 
