@@ -369,39 +369,105 @@ def menu_inventory():
         elif choice == "6":
             inv_edit_labels(db)
 
-
 def inv_list(db: DB):
-    console.clear()
-    header()
-    console.print("[bold]Inventory list[/bold]\n")
+        inv_browse(db, title="Inventory (all)", order_by="vendor, sku")
 
-    rows = db.rows("""
-        SELECT part_key, vendor, sku, label_short, on_hand, avg_unit_cost, last_invoice
-        FROM inventory_view
-        ORDER BY last_invoice DESC
-        LIMIT 30
-    """)
+def inv_browse(
+    db: DB,
+    where_sql: str | None = None,
+    params: list | None = None,
+    title: str = "Inventory browse",
+    order_by: str = "vendor, sku",
+):
+    """
+    Paged browser for inventory_view.
+    - where_sql: e.g. "WHERE vendor LIKE ? OR sku LIKE ?"
+    - params: matching parameters for where_sql
+    """
+    params = params or []
+    page_sizes = [10, 25, 50, 100]
+    page_size = 25
+    page = 1
 
-    t = Table(show_header=True, header_style="bold magenta")
-    t.add_column("part_key", style="dim")
-    t.add_column("vendor", width=10)
-    t.add_column("sku", width=14)
-    t.add_column("label_short")
-    t.add_column("on_hand", justify="right", width=8)
-    t.add_column("avg_cost", justify="right", width=10)
+    base_where = f" {where_sql} " if where_sql else ""
 
-    for r in rows:
-        t.add_row(
-            safe_str(r["part_key"]),
-            safe_str(r["vendor"]),
-            safe_str(r["sku"]),
-            shorten(r["label_short"], 56),
-            safe_str(r["on_hand"]),
-            safe_str(r["avg_unit_cost"]),
+    def total_rows() -> int:
+        return int(db.scalar(f"SELECT COUNT(*) FROM inventory_view{base_where}", params) or 0)
+
+    def fetch_page(p: int, ps: int):
+        offset = (p - 1) * ps
+        sql = f"""
+            SELECT part_key, vendor, sku, label_short, on_hand, avg_unit_cost, last_invoice
+            FROM inventory_view
+            {base_where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+        """
+        return db.rows(sql, params + [ps, offset])
+
+    while True:
+        console.clear()
+        header()
+        console.print(f"[bold]{title}[/bold]\n")
+
+        total = total_rows()
+        if total == 0:
+            console.print("[yellow]No rows found.[/yellow]")
+            pause()
+            return
+
+        max_page = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, max_page))
+
+        rows = fetch_page(page, page_size)
+
+        t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("part_key", style="dim")
+        t.add_column("vendor", width=10)
+        t.add_column("sku", width=14)
+        t.add_column("label_short")
+        t.add_column("on_hand", justify="right", width=8)
+        t.add_column("avg_cost", justify="right", width=10)
+
+        for r in rows:
+            t.add_row(
+                safe_str(r["part_key"]),
+                safe_str(r["vendor"]),
+                safe_str(r["sku"]),
+                shorten(r["label_short"], 60),
+                safe_str(r["on_hand"]),
+                safe_str(r["avg_unit_cost"]),
+            )
+
+        console.print(t)
+        console.print(
+            f"\nPage [cyan]{page}[/cyan] / [cyan]{max_page}[/cyan]  |  "
+            f"Rows: [cyan]{total}[/cyan]  |  Page size: [cyan]{page_size}[/cyan]\n"
+            "[dim]Commands:[/dim] [bold]n[/bold] next  [bold]p[/bold] prev  "
+            "[bold]g[/bold] goto  [bold]s[/bold] size  [bold]q[/bold] back"
         )
-    console.print(t)
-    pause()
 
+        cmd = Prompt.ask(">", default="n").strip().lower()
+
+        if cmd == "q":
+            return
+        elif cmd == "n":
+            if page < max_page:
+                page += 1
+        elif cmd == "p":
+            if page > 1:
+                page -= 1
+        elif cmd == "g":
+            page = IntPrompt.ask("Go to page", default=page)
+        elif cmd == "s":
+            page_size = IntPrompt.ask(f"Page size {page_sizes}", default=page_size)
+            if page_size not in page_sizes:
+                page_size = min(page_sizes, key=lambda x: abs(x - page_size))
+            page = 1
+        else:
+            # allow numbers to mean "goto page"
+            if cmd.isdigit():
+                page = int(cmd)
 
 def inv_search(db: DB):
     console.clear()
@@ -413,36 +479,20 @@ def inv_search(db: DB):
         return
 
     like = f"%{term}%"
-    rows = db.rows("""
-        SELECT part_key, vendor, sku, label_short, on_hand
-        FROM inventory_view
-        WHERE part_key LIKE ? COLLATE NOCASE
-           OR sku LIKE ? COLLATE NOCASE
-           OR vendor LIKE ? COLLATE NOCASE
-           OR description LIKE ? COLLATE NOCASE
-           OR label_short LIKE ? COLLATE NOCASE
-        ORDER BY on_hand DESC, vendor, sku
-        LIMIT 60
-    """, [like, like, like, like, like])
-
-    t = Table(show_header=True, header_style="bold magenta")
-    t.add_column("part_key", style="dim")
-    t.add_column("vendor", width=10)
-    t.add_column("sku", width=14)
-    t.add_column("label_short")
-    t.add_column("on_hand", justify="right", width=8)
-
-    for r in rows:
-        t.add_row(
-            safe_str(r["part_key"]),
-            safe_str(r["vendor"]),
-            safe_str(r["sku"]),
-            shorten(r["label_short"], 60),
-            safe_str(r["on_hand"]),
-        )
-
-    console.print(t)
-    pause()
+    where_sql = """
+    WHERE part_key LIKE ? COLLATE NOCASE
+       OR sku LIKE ? COLLATE NOCASE
+       OR vendor LIKE ? COLLATE NOCASE
+       OR description LIKE ? COLLATE NOCASE
+       OR label_short LIKE ? COLLATE NOCASE
+    """
+    inv_browse(
+        db,
+        where_sql=where_sql,
+        params=[like, like, like, like, like],
+        title=f"Search: {term}",
+        order_by="on_hand DESC, vendor, sku",
+    )
 
 
 def inv_show(db: DB):
