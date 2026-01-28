@@ -8,6 +8,8 @@ import hashlib
 import shutil
 import sqlite3
 import uuid
+import os
+from urllib.parse import quote_plus
 
 import pandas as pd
 
@@ -187,6 +189,71 @@ def make_label_fields(vendor: str, sku: str, description: str, mfg_pn: str | Non
             line2 = str(sku).strip()
 
     return desc_clean, line1, line2
+# ----------------------------
+# Links + QR targets
+# ----------------------------
+
+QR_TARGET = os.environ.get("QR_TARGET", "purchase").strip().lower()
+AIRTABLE_ITEM_URL_TEMPLATE = os.environ.get("AIRTABLE_ITEM_URL_TEMPLATE", "").strip()
+
+def make_purchase_url(vendor: str, sku: str) -> str:
+    """
+    Returns a URL that can be encoded in a QR code for quick re-ordering.
+    """
+    v = (vendor or "").strip().lower()
+    s = (sku or "").strip()
+    if not v or not s:
+        return ""
+    if v == "digikey":
+        # Search-by-keywords works reliably with Digi-Key part numbers
+        return f"https://www.digikey.com/en/products?keywords={quote_plus(s)}"
+    if v == "mcmaster":
+        # McMaster deep-links commonly use a fragment with the part number
+        return f"https://www.mcmaster.com/#{quote_plus(s)}"
+    if v == "arduino":
+        # Arduino store search (Shopify) – use SKU as query
+        return f"https://store-usa.arduino.cc/search?type=product%2Cquery&options%5Bprefix%5D=last&q={quote_plus(s)}"
+    return ""
+
+def make_airtable_url(part_key: str, vendor: str, sku: str) -> str:
+    """
+    Optional: provide AIRTABLE_ITEM_URL_TEMPLATE, e.g.
+      AIRTABLE_ITEM_URL_TEMPLATE="https://airtable.com/appXXXX/tblYYYY/{part_key}"
+    Supported tokens: {part_key}, {vendor}, {sku}
+    """
+    if not AIRTABLE_ITEM_URL_TEMPLATE:
+        return ""
+    try:
+        return AIRTABLE_ITEM_URL_TEMPLATE.format(part_key=part_key, vendor=vendor, sku=sku)
+    except Exception:
+        return ""
+
+def pick_qr_url(purchase_url: str, airtable_url: str) -> str:
+    """
+    Chooses the URL to encode in the QR code.
+    Set QR_TARGET=airtable to prefer airtable_url when available.
+    """
+    p = (purchase_url or "").strip()
+    a = (airtable_url or "").strip()
+    if QR_TARGET == "airtable":
+        return a or p
+    return p or a
+
+def make_label_short(label_line1: str, label_line2: str, *, sku: str = "", mfg_pn: str | None = None, max_len: int = 42) -> str:
+    """
+    A compact one-liner suitable for small QR labels.
+    """
+    l1 = (label_line1 or "").strip()
+    l2 = (label_line2 or "").strip()
+    base = l1
+    if l2 and (not l1 or l2.lower() not in l1.lower()):
+        base = f"{l1} ({l2})" if l1 else l2
+    if not base:
+        base = (str(mfg_pn).strip() if mfg_pn else "") or (sku or "").strip()
+    base = re.sub(r"\\s+", " ", base).strip()
+    if len(base) > max_len:
+        base = base[: max_len - 3].rstrip() + "..."
+    return base
 
 def make_line_item_uid(
     *,
@@ -407,6 +474,29 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             return f"{v}:{hash(desc)}"
 
         line_items_df["part_key"] = line_items_df.apply(_part_key, axis=1)
+        # Links + QR targets (purchase URL and optional Airtable URL)
+        line_items_df["purchase_url"] = line_items_df.apply(
+            lambda r: make_purchase_url(str(r.get("vendor", "") or ""), str(r.get("sku", "") or "")),
+            axis=1
+        )
+        line_items_df["airtable_url"] = line_items_df.apply(
+            lambda r: make_airtable_url(str(r.get("part_key", "") or ""), str(r.get("vendor", "") or ""), str(r.get("sku", "") or "")),
+            axis=1
+        )
+        line_items_df["label_qr_url"] = line_items_df.apply(
+            lambda r: pick_qr_url(str(r.get("purchase_url", "") or ""), str(r.get("airtable_url", "") or "")),
+            axis=1
+        )
+        line_items_df["label_qr_text"] = line_items_df["label_qr_url"]
+        line_items_df["label_short"] = line_items_df.apply(
+            lambda r: make_label_short(
+                str(r.get("label_line1", "") or ""),
+                str(r.get("label_line2", "") or ""),
+                sku=str(r.get("sku", "") or ""),
+                mfg_pn=(r.get("mfg_pn") if "mfg_pn" in line_items_df.columns else None),
+            ),
+            axis=1
+        )
 
         parts_received_df = (
             line_items_df.groupby("part_key", as_index=False)
@@ -418,6 +508,11 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
                 desc_clean=("desc_clean", "first"),
                 label_line1=("label_line1", "first"),
                 label_line2=("label_line2", "first"),
+                label_short=("label_short", "first"),
+                purchase_url=("purchase_url", "first"),
+                airtable_url=("airtable_url", "first"),
+                label_qr_url=("label_qr_url", "first"),
+                label_qr_text=("label_qr_text", "first"),
                 units_received=("units_received", "sum"),
                 total_spend=("line_total", "sum") if "line_total" in line_items_df.columns else ("units_received", "sum"),
                 last_invoice=("invoice", "max") if "invoice" in line_items_df.columns else ("vendor", "first"),
@@ -425,7 +520,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         )
         parts_received_df["avg_unit_cost"] = parts_received_df["total_spend"] / parts_received_df["units_received"].replace({0: pd.NA})
     else:
-        parts_received_df = pd.DataFrame(columns=["part_key", "vendor", "sku", "description", "desc_clean", "label_line1", "label_line2", "units_received", "total_spend", "last_invoice", "avg_unit_cost"])
+        parts_received_df = pd.DataFrame(columns=["part_key", "vendor", "sku", "description", "desc_clean", "label_line1", "label_line2", "label_short", "purchase_url", "airtable_url", "label_qr_url", "label_qr_text", "units_received", "total_spend", "last_invoice", "avg_unit_cost"])
 
     parts_removed_df = pd.DataFrame(columns=["removal_uid","part_key","qty_removed","ts_utc","project","note"])
     return orders_df, line_items_df, parts_received_df, parts_removed_df
@@ -579,6 +674,11 @@ def init_inventory_db(dbfile: Path):
                 desc_clean TEXT,
                 label_line1 TEXT,
                 label_line2 TEXT,
+                label_short TEXT,
+                purchase_url TEXT,
+                airtable_url TEXT,
+                label_qr_url TEXT,
+                label_qr_text TEXT,
                 line INTEGER,
                 ordered INTEGER,
                 shipped INTEGER,
@@ -601,6 +701,11 @@ def init_inventory_db(dbfile: Path):
                 desc_clean TEXT,
                 label_line1 TEXT,
                 label_line2 TEXT,
+                label_short TEXT,
+                purchase_url TEXT,
+                airtable_url TEXT,
+                label_qr_url TEXT,
+                label_qr_text TEXT,
                 units_received REAL,
                 total_spend REAL,
                 last_invoice TEXT,
@@ -626,7 +731,22 @@ def init_inventory_db(dbfile: Path):
         conn.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 part_key TEXT PRIMARY KEY,
+                vendor TEXT,
+                sku TEXT,
+                description TEXT,
+                desc_clean TEXT,
+                label_line1 TEXT,
+                label_line2 TEXT,
+                label_short TEXT,
+                purchase_url TEXT,
+                airtable_url TEXT,
+                label_qr_url TEXT,
+                units_received REAL,
+                units_removed REAL,
                 on_hand REAL,
+                avg_unit_cost REAL,
+                total_spend REAL,
+                last_invoice TEXT,
                 updated_utc TEXT
             );
         """)
@@ -638,8 +758,8 @@ def init_inventory_db(dbfile: Path):
         conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_vendor ON orders(vendor);')
 
         # Ensure label columns exist (supports schema upgrades without rebuilding the DB)
-        _ensure_columns(conn, "line_items", ["desc_clean", "label_line1", "label_line2"])
-        _ensure_columns(conn, "parts_received", ["desc_clean", "label_line1", "label_line2"])
+        _ensure_columns(conn, "line_items", ["desc_clean", "label_line1", "label_line2", "label_short", "purchase_url", "airtable_url", "label_qr_url", "label_qr_text"])
+        _ensure_columns(conn, "parts_received", ["desc_clean", "label_line1", "label_line2", "label_short", "purchase_url", "airtable_url", "label_qr_url", "label_qr_text"])
 
         # View: computed inventory (received - removed)
         conn.execute("DROP VIEW IF EXISTS inventory_view;")
@@ -653,6 +773,11 @@ def init_inventory_db(dbfile: Path):
                 pr.desc_clean,
                 pr.label_line1,
                 pr.label_line2,
+                pr.label_short,
+                pr.purchase_url,
+                pr.airtable_url,
+                pr.label_qr_url,
+                pr.label_qr_text,
                 pr.units_received,
                 COALESCE(r.removed, 0) AS units_removed,
                 (pr.units_received - COALESCE(r.removed, 0)) AS on_hand,
@@ -683,7 +808,22 @@ def update_database(orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_
         # Refresh materialized on-hand snapshot from the view (DELETE+INSERT for broad SQLite compatibility)
         ts = datetime.utcnow().isoformat()
         conn.execute("DELETE FROM inventory;")
-        conn.execute("INSERT INTO inventory(part_key, on_hand, updated_utc) SELECT part_key, on_hand, ? FROM inventory_view;", (ts,))
+        conn.execute("""
+            INSERT INTO inventory(
+                part_key, vendor, sku, description, desc_clean,
+                label_line1, label_line2, label_short,
+                purchase_url, airtable_url, label_qr_url,
+                units_received, units_removed, on_hand,
+                avg_unit_cost, total_spend, last_invoice, updated_utc
+            )
+            SELECT
+                part_key, vendor, sku, description, desc_clean,
+                label_line1, label_line2, label_short,
+                purchase_url, airtable_url, label_qr_url,
+                units_received, units_removed, on_hand,
+                avg_unit_cost, total_spend, last_invoice, ?
+            FROM inventory_view;
+        """, (ts,))
         inventory_on_hand_df = pd.read_sql_query("SELECT * FROM inventory_view;", conn)
         conn.commit()
     return inventory_on_hand_df
@@ -769,6 +909,11 @@ def cli():
                 desc_clean=("desc_clean", "first"),
                 label_line1=("label_line1", "first"),
                 label_line2=("label_line2", "first"),
+                label_short=("label_short", "first"),
+                purchase_url=("purchase_url", "first"),
+                airtable_url=("airtable_url", "first"),
+                label_qr_url=("label_qr_url", "first"),
+                label_qr_text=("label_qr_text", "first"),
                 units_received=("units_received", "sum"),
                 total_spend=("line_total", "sum") if "line_total" in items.columns else ("units_received", "sum"),
                 last_invoice=("invoice", "max") if "invoice" in items.columns else ("vendor", "first"),
