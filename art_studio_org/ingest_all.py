@@ -24,6 +24,21 @@ from vendors.registry import pick_parser
 # Duplicate detection + stable IDs
 # ----------------------------
 
+
+# ----------------------------
+# Quiet noisy PDF font warnings (pdfminer)
+# ----------------------------
+import logging
+
+def suppress_pdfminer_font_warnings() -> None:
+    """Silence pdfminer warnings like 'Could not get FontBBox...'."""
+    for name in ("pdfminer", "pdfminer.pdffont", "pdfminer.psparser", "pdfminer.pdfinterp"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+suppress_pdfminer_font_warnings()
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

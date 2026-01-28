@@ -155,6 +155,31 @@ def make_label_fields(vendor: str, sku: str, description: str, mfg_pn: str | Non
         line1 = (mfg_pn or sku or "").strip()
         return desc_clean, line1, ""
 
+    # Special case: multi-line descriptions that end in a CAD filename (e.g., SendCutSend)
+    # Example:
+    #   6061 T6 Aluminum (.250")
+    #   1.693 x 2.586 in
+    #   Adjustment_Assembly_Male_v6.step
+    desc_lines = [ln.strip() for ln in re.split(r"[\r\n]+", desc_clean) if ln.strip()]
+    if len(desc_lines) >= 2:
+        last = desc_lines[-1]
+        # If the last line looks like a file name, use it as the display name
+        if re.search(r"\.(step|stp|dxf|dwg|iges|igs|sldprt|sldasm|pdf)\b", last, re.I):
+            material = desc_lines[0]
+            dims = desc_lines[1] if len(desc_lines) > 1 else ""
+            # If there are extra lines between dims and filename, fold them into dims/specs
+            extra = desc_lines[2:-1]
+            spec_bits = [dims] + extra if extra else [dims]
+            spec_bits = [b for b in ( _tighten_units(x) for x in spec_bits ) if b]
+            line2 = " — ".join([material] + spec_bits) if spec_bits else material
+            return desc_clean, last, line2
+
+    # If SKU itself is a CAD filename, prefer it as the name
+    if sku and re.search(r"\.(step|stp|dxf|dwg|iges|igs|sldprt|sldasm|pdf)\b", str(sku).strip(), re.I):
+        # Use the (cleaned) description as the spec line
+        spec = " — ".join([ln.strip() for ln in re.split(r"[\r\n]+", desc_clean) if ln.strip()])
+        return desc_clean, str(sku).strip(), spec
+
     # McMaster-style comma specs work great for labels
     parts = [p.strip() for p in desc_clean.split(",") if p.strip()]
 

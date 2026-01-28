@@ -23,6 +23,21 @@ from art_studio_org.vendors.registry import pick_parser
 # Simple run logger
 # ----------------------------
 
+
+# ----------------------------
+# Quiet noisy PDF font warnings (pdfminer)
+# ----------------------------
+import logging
+
+def suppress_pdfminer_font_warnings() -> None:
+    """Silence pdfminer warnings like 'Could not get FontBBox...'."""
+    for name in ("pdfminer", "pdfminer.pdffont", "pdfminer.psparser", "pdfminer.pdfinterp"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+suppress_pdfminer_font_warnings()
+
 class RunLogger:
     def __init__(self, log_path: Path, echo: bool = True):
         self.log_path = log_path
