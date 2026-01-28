@@ -896,11 +896,8 @@ def labels_make_pdf(db: DB):
     default_tpl = "label_templates/avery_94102.json"
     tpl = Prompt.ask("Template file", default=default_tpl).strip()
 
-    # Treat '.' or empty as "use default"
     if tpl in ("", "."):
         tpl = default_tpl
-
-    # If user types just the filename, assume label_templates/
     if "/" not in tpl:
         tpl = f"label_templates/{tpl}"
 
@@ -912,71 +909,61 @@ def labels_make_pdf(db: DB):
 
     # choose items
     mode = Prompt.ask("Pick items by", choices=["vendor", "search", "part_keys"], default="vendor")
-
     rows = []
 
     if mode == "vendor":
         vendor = Prompt.ask("Vendor (e.g. mcmaster, digikey)", default="mcmaster").strip()
         rows = db.rows("""
-                       SELECT part_key,
-                              vendor,
-                              sku,
-                              label_line1,
-                              label_line2,
-                              label_short,
-                              purchase_url,
-                              label_qr_text
-                       FROM parts_received
-                       WHERE vendor = ?
-                       ORDER BY sku
-                       """, [vendor])
-
-
+            SELECT
+                part_key, vendor, sku,
+                label_line1, label_line2, label_short,
+                purchase_url, label_qr_text
+            FROM parts_received
+            WHERE vendor = ?
+            ORDER BY sku
+        """, [vendor])
 
     elif mode == "search":
         term = Prompt.ask("Search term", default="").strip()
+        if not term:
+            return
         like = f"%{term}%"
         rows = db.rows("""
-                       SELECT part_key,
-                              vendor,
-                              sku,
-                              label_line1,
-                              label_line2,
-                              label_short,
-                              purchase_url,
-                              label_qr_text
-                       FROM parts_received
-                       WHERE vendor = ?
-                       ORDER BY sku
-                       """, [vendor])
+            SELECT
+                part_key, vendor, sku,
+                label_line1, label_line2, label_short,
+                purchase_url, label_qr_text
+            FROM parts_received
+            WHERE part_key LIKE ? COLLATE NOCASE
+               OR sku LIKE ? COLLATE NOCASE
+               OR description LIKE ? COLLATE NOCASE
+               OR label_short LIKE ? COLLATE NOCASE
+               OR vendor LIKE ? COLLATE NOCASE
+            ORDER BY vendor, sku
+            LIMIT 200
+        """, [like, like, like, like, like])
 
-
-    else:
+    else:  # part_keys
         keys = Prompt.ask("Paste part_keys (comma-separated)", default="").strip()
         part_keys = [k.strip() for k in keys.split(",") if k.strip()]
         if not part_keys:
             return
         qmarks = ",".join(["?"] * len(part_keys))
-        rows = db.rows("""
-    SELECT part_key,
-                              vendor,
-                              sku,
-                              label_line1,
-                              label_line2,
-                              label_short,
-                              purchase_url,
-                              label_qr_text
-                       FROM parts_received
-                       WHERE vendor = ?
-                       ORDER BY sku
-                       """, [vendor])
+        rows = db.rows(f"""
+            SELECT
+                part_key, vendor, sku,
+                label_line1, label_line2, label_short,
+                purchase_url, label_qr_text
+            FROM parts_received
+            WHERE part_key IN ({qmarks})
+            ORDER BY vendor, sku
+        """, part_keys)
 
     if not rows:
         console.print("[yellow]No items found.[/yellow]")
         pause()
         return
 
-    # start position + qr
     start_pos = IntPrompt.ask("Start label position (1 = first label top-left)", default=1)
     include_qr = Confirm.ask("Include QR code?", default=False)
 
