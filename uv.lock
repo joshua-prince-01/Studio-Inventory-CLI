@@ -918,6 +918,7 @@ dependencies = [
     { name = "pandas" },
     { name = "pdfplumber" },
     { name = "python-dotenv" },
+    { name = "reportlab" },
     { name = "requests" },
     { name = "requests-pkcs12" },
     { name = "typer" },
@@ -930,9 +931,23 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.0" },
     { name = "pdfplumber", specifier = ">=0.11.9" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
+    { name = "reportlab", specifier = ">=4.4.9" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "requests-pkcs12", specifier = ">=1.27" },
     { name = "typer", specifier = ">=0.21.1" },
+]
+
+[[package]]
+name = "reportlab"
+version = "4.4.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "charset-normalizer" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/39/42cf24aee570a80e1903221ae3a92a2e34c324794a392eb036cbb6dc3839/reportlab-4.4.9.tar.gz", hash = "sha256:7cf487764294ee791a4781f5a157bebce262a666ae4bbb87786760a9676c9378", size = 3911246, upload-time = "2026-01-15T10:07:56.08Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/17/77/546e50edfaba6a0e58e8ec5fdc4446510227cec9e8f40172b60941d5a633/reportlab-4.4.9-py3-none-any.whl", hash = "sha256:68e2d103ae8041a37714e8896ec9b79a1c1e911d68c3bd2ea17546568cf17bfd", size = 1954401, upload-time = "2026-01-15T09:27:59.133Z" },
 ]
 
 [[package]]
