@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 from uuid import uuid4
+
+import csv
+import subprocess
+import sys
 
 import typer
 from rich.console import Console
@@ -12,7 +16,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
-from art_studio_org.db import DB, default_db_path
+from art_studio_org.db import DB, default_db_path, project_root
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -26,7 +30,7 @@ def utc_now_iso() -> str:
 
 
 def header():
-    console.print(Panel.fit("[bold]Studio Inventory CLI[/bold]\nVersion 1.0", border_style="cyan"))
+    console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
 
 def pause():
@@ -47,14 +51,102 @@ def shorten(s: str, n: int = 54) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def exports_dir() -> Path:
+    d = project_root() / "exports"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def timestamp_slug() -> str:
+    # local time is fine for filenames
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# ----------------------------
+# Legacy ingest runner (subprocess)
+# ----------------------------
+def run_module_in_subprocess(module_name: str) -> int:
+    """
+    Run: python -m <module_name> from project root, so relative paths behave.
+    Returns process returncode.
+    """
+    cmd = [sys.executable, "-m", module_name]
+    console.print(f"\n[dim]Running:[/dim] {' '.join(cmd)}")
+    try:
+        # Let the child process use the terminal normally (interactive prompts etc.)
+        proc = subprocess.run(cmd, cwd=str(project_root()))
+        return proc.returncode
+    except FileNotFoundError:
+        console.print("[red]Python executable not found.[/red]")
+        return 1
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        return 130
+
+
+def run_legacy_ingest() -> None:
+    """
+    Tries the most likely current entrypoint first.
+    """
+    # 1) Try the existing "main" flow
+    rc = run_module_in_subprocess("art_studio_org.main")
+    if rc == 0:
+        console.print("[green]Ingest completed.[/green]")
+        return
+
+    console.print(f"[yellow]art_studio_org.main exited with code {rc}. Trying fallback…[/yellow]")
+
+    # 2) Fallback: ingest_all
+    rc2 = run_module_in_subprocess("art_studio_org.ingest_all")
+    if rc2 == 0:
+        console.print("[green]Ingest completed.[/green]")
+        return
+
+    console.print(f"[red]Ingest failed.[/red] exit codes: main={rc}, ingest_all={rc2}")
+
+
+# ----------------------------
+# Export helpers
+# ----------------------------
+def object_columns(db: DB, name: str) -> list[str]:
+    info = db.rows(f"PRAGMA table_info({name})")
+    return [r["name"] for r in info]
+
+
+def export_sqlite_object_to_csv(
+    db: DB,
+    name: str,
+    out_path: Path,
+    order_by: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> None:
+    cols = object_columns(db, name)
+    if not cols:
+        raise RuntimeError(f"Could not read columns for {name}")
+
+    sql = f"SELECT * FROM {name}"
+    if order_by:
+        sql += f" ORDER BY {order_by}"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+
+    rows = db.rows(sql)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r[c] for c in cols])
+
+    console.print(f"[green]Exported[/green] {name} → [cyan]{out_path}[/cyan] ({len(rows)} rows)")
+
+
 # ----------------------------
 # Menu-first entry
 # ----------------------------
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
-    """
-    Menu-first launcher. If you later pass subcommands, it won't show the menu.
-    """
     if ctx.invoked_subcommand is None:
         run_menu()
 
@@ -65,8 +157,8 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists [dim](hook in next)[/dim]")
-        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports) [dim](hook in next)[/dim]")
+        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists")
+        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
         menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
         menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
         menu.add_row("5.", "[bold]Labels[/bold] generate PDFs [dim](coming soon)[/dim]")
@@ -94,42 +186,148 @@ def run_menu():
 
 
 # ----------------------------
-# Stubs (wire to your existing logic later)
+# Ingest (wired)
 # ----------------------------
 def menu_ingest():
+    db = get_db()
+
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Ingest[/bold]\n")
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Run ingest (legacy flow)")
+        menu.add_row("2.", "Show recent ingested files")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "2", "0"], default="1")
+        if choice == "0":
+            return
+        if choice == "1":
+            run_legacy_ingest()
+            pause()
+        elif choice == "2":
+            show_recent_ingests(db)
+
+
+def show_recent_ingests(db: DB):
     console.clear()
     header()
-    console.print("[bold]Ingest[/bold]\n")
-    console.print("TODO: call your existing ingest flow (ingest_all.py / main.py).")
-    pause()
+    console.print("[bold]Recent ingests[/bold]\n")
 
+    try:
+        rows = db.rows("""
+            SELECT first_seen_utc, vendor, order_ref, original_path
+            FROM ingested_files
+            ORDER BY first_seen_utc DESC
+            LIMIT 30
+        """)
+    except Exception as e:
+        console.print(f"[red]Query failed:[/red] {e}")
+        pause()
+        return
 
-def menu_export():
-    console.clear()
-    header()
-    console.print("[bold]Export[/bold]\n")
-    console.print("TODO: export inventory_view / orders / line_items as CSVs.")
-    pause()
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("first_seen_utc", style="dim", width=22)
+    t.add_column("vendor", width=12)
+    t.add_column("order_ref", width=14)
+    t.add_column("original_path")
 
+    for r in rows:
+        t.add_row(
+            safe_str(r["first_seen_utc"]),
+            safe_str(r["vendor"]),
+            safe_str(r["order_ref"]),
+            shorten(r["original_path"], 90),
+        )
 
-def menu_vendors():
-    console.clear()
-    header()
-    console.print("[bold]Vendors[/bold]\n")
-    console.print("Next: DigiKey OAuth + product/media enrichment, then McMaster cert-based API enrichment.")
-    pause()
-
-
-def menu_labels():
-    console.clear()
-    header()
-    console.print("[bold]Labels[/bold]\n")
-    console.print("Paused for now. Once vendor enrichment is in, labels become DB-driven.")
+    console.print(t)
     pause()
 
 
 # ----------------------------
-# Inventory (REAL)
+# Export (implemented)
+# ----------------------------
+def menu_export():
+    db = get_db()
+    if not db.path.exists():
+        console.clear()
+        header()
+        console.print(f"[red]DB not found:[/red] {db.path}")
+        pause()
+        return
+
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Export[/bold]\n")
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Export inventory_view (recommended)")
+        menu.add_row("2.", "Export orders")
+        menu.add_row("3.", "Export line_items")
+        menu.add_row("4.", "Export parts_received")
+        menu.add_row("5.", "Export parts_removed")
+        menu.add_row("6.", "Export ingested_files")
+        menu.add_row("7.", "Export ALL of the above")
+        menu.add_row("0.", "Back")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=[str(i) for i in range(0, 8)], default="1")
+        if choice == "0":
+            return
+
+        slug = timestamp_slug()
+        outdir = exports_dir() / f"export_{slug}"
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if choice == "1":
+                export_sqlite_object_to_csv(
+                    db,
+                    "inventory_view",
+                    outdir / "inventory_view.csv",
+                    order_by="vendor, sku",
+                )
+            elif choice == "2":
+                export_sqlite_object_to_csv(
+                    db, "orders", outdir / "orders.csv", order_by="vendor, order_date"
+                )
+            elif choice == "3":
+                export_sqlite_object_to_csv(
+                    db, "line_items", outdir / "line_items.csv", order_by="vendor, invoice, line_item_uid"
+                )
+            elif choice == "4":
+                export_sqlite_object_to_csv(
+                    db, "parts_received", outdir / "parts_received.csv", order_by="vendor, sku"
+                )
+            elif choice == "5":
+                export_sqlite_object_to_csv(
+                    db, "parts_removed", outdir / "parts_removed.csv", order_by="ts_utc DESC"
+                )
+            elif choice == "6":
+                export_sqlite_object_to_csv(
+                    db, "ingested_files", outdir / "ingested_files.csv", order_by="first_seen_utc DESC"
+                )
+            elif choice == "7":
+                export_sqlite_object_to_csv(db, "inventory_view", outdir / "inventory_view.csv", order_by="vendor, sku")
+                export_sqlite_object_to_csv(db, "orders", outdir / "orders.csv", order_by="vendor, order_date")
+                export_sqlite_object_to_csv(db, "line_items", outdir / "line_items.csv", order_by="vendor, invoice, line_item_uid")
+                export_sqlite_object_to_csv(db, "parts_received", outdir / "parts_received.csv", order_by="vendor, sku")
+                export_sqlite_object_to_csv(db, "parts_removed", outdir / "parts_removed.csv", order_by="ts_utc DESC")
+                export_sqlite_object_to_csv(db, "ingested_files", outdir / "ingested_files.csv", order_by="first_seen_utc DESC")
+
+            console.print(f"\n[cyan]Export folder:[/cyan] {outdir}")
+        except Exception as e:
+            console.print(f"[red]Export failed:[/red] {e}")
+
+        pause()
+
+
+# ----------------------------
+# Inventory (unchanged from our last version; kept here)
 # ----------------------------
 def menu_inventory():
     db = get_db()
@@ -301,7 +499,6 @@ def inv_remove(db: DB):
     if not part_key:
         return
 
-    # confirm exists
     exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
     if not exists:
         console.print("[red]part_key not found in parts_received.[/red]")
@@ -352,12 +549,10 @@ def inv_receive(db: DB):
 
     added_spend = qty * unit_cost_f
 
-    # Only ask metadata if new part_key
     exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
     ts = utc_now_iso()
 
     if exists:
-        # Increment units_received and (optionally) total_spend; recompute avg_unit_cost if we have spend
         db.execute("""
             UPDATE parts_received
             SET
@@ -391,7 +586,6 @@ def inv_receive(db: DB):
     label_qr_text = Prompt.ask("label_qr_text (optional)", default="")
 
     desc_clean = description.strip()
-
     avg_unit_cost = (added_spend / qty) if (qty > 0 and added_spend > 0) else 0.0
 
     db.execute("""
@@ -429,12 +623,11 @@ def inv_edit_labels(db: DB):
         return
 
     r = rows[0]
-    console.print("[dim]Leave blank to keep current values.[/dim]\n")
+    console.print("[dim]Edit values; leave as-is to keep current.[/dim]\n")
 
-    def ask_keep(field: str) -> Optional[str]:
+    def ask_keep(field: str) -> str:
         cur = safe_str(r[field])
-        val = Prompt.ask(f"{field}", default=cur).strip()
-        return val
+        return Prompt.ask(field, default=cur).strip()
 
     label_line1 = ask_keep("label_line1")
     label_line2 = ask_keep("label_line2")
@@ -464,7 +657,7 @@ def inv_edit_labels(db: DB):
 
 
 # ----------------------------
-# DB diagnostics (REAL)
+# DB diagnostics
 # ----------------------------
 def menu_db_diagnostics():
     db_path = default_db_path()
@@ -506,32 +699,31 @@ def menu_db_diagnostics():
         t.add_row(typ, name, count)
 
     console.print(t)
-
-    if Confirm.ask("\nShow schema for a table/view?", default=False):
-        name = Prompt.ask("Name (e.g. parts_received)", default="inventory_view").strip()
-        if name:
-            info = db.rows(f"PRAGMA table_info({name})")
-            st = Table(title=f"Schema: {name}", show_header=True, header_style="bold cyan")
-            st.add_column("cid", justify="right", width=4)
-            st.add_column("name")
-            st.add_column("type", width=10)
-            st.add_column("pk", justify="right", width=3)
-            for c in info:
-                st.add_row(str(c["cid"]), safe_str(c["name"]), safe_str(c["type"]), str(c["pk"]))
-            console.print(st)
-
     pause()
 
 
 # ----------------------------
-# Future subcommands (placeholders)
+# Future stubs
 # ----------------------------
-@app.command()
-def inventory():
-    """Non-interactive entrypoint later: inventory ..."""
-    console.print("Use the menu for now. (Subcommands coming soon.)")
+def menu_vendors():
+    console.clear()
+    header()
+    console.print("[bold]Vendors[/bold]\n")
+    console.print("Next: DigiKey OAuth + product/media enrichment, then McMaster cert-based API enrichment.")
+    pause()
 
 
+def menu_labels():
+    console.clear()
+    header()
+    console.print("[bold]Labels[/bold]\n")
+    console.print("Paused for now. Once vendor enrichment is in, labels become DB-driven.")
+    pause()
+
+
+# ----------------------------
+# Placeholder subcommands
+# ----------------------------
 @app.command()
 def ingest():
     console.print("Use the menu for now. (Subcommands coming soon.)")
@@ -539,16 +731,6 @@ def ingest():
 
 @app.command()
 def export():
-    console.print("Use the menu for now. (Subcommands coming soon.)")
-
-
-@app.command()
-def vendors():
-    console.print("Use the menu for now. (Subcommands coming soon.)")
-
-
-@app.command()
-def labels():
     console.print("Use the menu for now. (Subcommands coming soon.)")
 
 
