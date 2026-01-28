@@ -445,35 +445,47 @@ def inv_browse(
         console.print(t)
         console.print(
             f"\nPage [cyan]{page}[/cyan] / [cyan]{max_page}[/cyan]  |  "
-            f"Rows: [cyan]{total}[/cyan]  |  Page size: [cyan]{page_size}[/cyan]\n"
-            "[dim]Commands:[/dim] [bold]n[/bold] next  [bold]p[/bold] prev  "
-            "[bold]g[/bold] goto  [bold]s[/bold] size  [bold]q[/bold] back"
+            f"Rows: [cyan]{total}[/cyan]  |  Page size: [cyan]{page_size}[/cyan]  |  "
+            f"Sort: [cyan]{order_by}[/cyan]\n"
+            "[dim]Commands:[/dim] "
+            "[bold]n[/bold] next  [bold]p[/bold] prev  [bold]g[/bold] goto  "
+            "[bold]s[/bold] size  [bold]v[/bold] sort-vendor  [bold]h[/bold] sort-on_hand  "
+            "[bold]q[/bold] back  [bold]<row#>[/bold] details"
         )
 
-        cmd = Prompt.ask(">", default="n").strip().lower()
+        cmd = Prompt.ask(">", default="n").strip()
+        cmd_l = cmd.lower()
 
-        if cmd == "q":
+        if cmd_l == "q":
             return
-        elif cmd == "n":
+        elif cmd_l == "n":
             if page < max_page:
                 page += 1
-        elif cmd == "p":
+        elif cmd_l == "p":
             if page > 1:
                 page -= 1
-        elif cmd == "g":
+        elif cmd_l == "g":
             page = IntPrompt.ask("Go to page", default=page)
-        elif cmd == "s":
+        elif cmd_l == "s":
             page_size = IntPrompt.ask(f"Page size {page_sizes}", default=page_size)
             if page_size not in page_sizes:
                 page_size = min(page_sizes, key=lambda x: abs(x - page_size))
             page = 1
-        elif cmd.isdigit():
-            idx = int(cmd) - 1
-            absolute_index = idx
-            target_page = absolute_index // page_size + 1
-            target_offset = absolute_index % page_size
 
-            # load that page
+        # NEW: sort hotkeys
+        elif cmd_l == "v":
+            order_by = "vendor, sku"
+            page = 1
+        elif cmd_l == "h":
+            order_by = "on_hand DESC, vendor, sku"
+            page = 1
+
+        # Drill-in by absolute row number
+        elif cmd.isdigit():
+            idx = int(cmd) - 1  # absolute row index (0-based)
+            target_page = idx // page_size + 1
+            target_offset = idx % page_size
+
             page = target_page
             rows = fetch_page(page, page_size)
 
@@ -481,6 +493,7 @@ def inv_browse(
                 part_key = rows[target_offset]["part_key"]
                 inv_show(db, part_key=part_key)
             continue
+
         else:
             # allow numbers to mean "goto page"
             if cmd.isdigit():
@@ -508,7 +521,7 @@ def inv_search(db: DB):
         where_sql=where_sql,
         params=[like, like, like, like, like],
         title=f"Search: {term}",
-        order_by="on_hand DESC, vendor, sku",
+        order_by="vendor, sku",
     )
 
 
