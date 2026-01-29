@@ -1,0 +1,10 @@
+{
+  "name": "Avery Presta 94102",
+  "page": { "width_in": 8.5, "height_in": 11.0 },
+  "label": { "width_in": 0.75, "height_in": 0.75 },
+  "grid": { "cols": 8, "rows": 10 },
+  "margins_in": { "left": 0.375, "top": 0.625 },
+  "pitch_in": { "x": 1.0, "y": 1.0 },
+  "padding_in": { "x": 0.05, "y": 0.05 },
+  "font": { "name": "Helvetica", "size": 6 }
+}

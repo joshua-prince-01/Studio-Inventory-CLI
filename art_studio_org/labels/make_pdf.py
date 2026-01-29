@@ -78,28 +78,6 @@ def _draw_qr(c: canvas.Canvas, x: float, y: float, size: float, text: str) -> No
     renderPDF.draw(d, c, x, y)
 
 
-def _fit_square_in_rect(
-    cx: float,
-    cy: float,
-    cw: float,
-    ch: float,
-    *,
-    pad_rel: float = 0.0,
-    pad_abs: float = 0.0,
-) -> tuple[float, float, float]:
-    """Return (qx, qy, qsize) for a square centered inside a rectangle.
-
-    - pad_rel: fraction of min(cw,ch)
-    - pad_abs: absolute padding in points
-    """
-    base = max(0.0, min(float(cw), float(ch)))
-    pad = max(0.0, float(pad_abs), float(pad_rel) * base)
-    size = max(0.0, base - 2.0 * pad)
-    qx = cx + (cw - size) / 2.0
-    qy = cy + (ch - size) / 2.0
-    return qx, qy, size
-
-
 def make_labels_pdf(
     *,
     template_path: Path,
@@ -357,10 +335,9 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
         qr_source = qr_cfg.get("source", "purchase_url")
         qr_text = _source_value(item, qr_source).strip()
         if qr_text:
-            # QR lives in the same 3x3 grid system as text elements.
-            # Add optional spanning + auto-fit so QR can fill the cell (or spanned cell)
-            # with a small padding.
             pos = qr_cfg.get("pos", "UR")
+
+            # Span across the template grid (like elements do)
             span_x = int(qr_cfg.get("span", qr_cfg.get("span_x", 1)) or 1)
             span_y = int(qr_cfg.get("span_y", 1) or 1)
             span_x = max(1, min(3, span_x))
@@ -368,27 +345,28 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
 
             cx, cy, cw, ch, _row = _cell_box(pos, x, y, w, h, span_x=span_x, span_y=span_y)
 
-            # New behavior: if fit='cell' (or pad_rel/pad is provided), fit QR to the cell bounds.
-            # Otherwise, keep legacy size_rel behavior.
-            fit = qr_cfg.get("fit", "")
-            pad_rel = qr_cfg.get("pad_rel", None)
-            pad_abs = qr_cfg.get("pad", None)
-            if fit in (True, "cell") or pad_rel is not None or pad_abs is not None:
-                pr = 0.06 if pad_rel is None else float(pad_rel)
-                pr = max(0.0, min(0.25, pr))
-                pa = 0.0 if pad_abs is None else float(pad_abs)
-                pa = max(0.0, pa)
-                qr_x, qr_y, qr_size = _fit_square_in_rect(cx, cy, cw, ch, pad_rel=pr, pad_abs=pa)
-                qr_size = max(10, min(qr_size, cw, ch))
+            fit = bool(qr_cfg.get("fit", False))
+            if fit:
+                # Fit a square QR into the spanned cell with padding
+                pad_rel = float(qr_cfg.get("pad_rel", 0.06))
+                pad_rel = max(0.0, min(0.15, pad_rel))
+                pad = pad_rel * min(cw, ch)
+
+                cw2 = max(0.0, cw - 2 * pad)
+                ch2 = max(0.0, ch - 2 * pad)
+                qr_size = min(cw2, ch2)
+                if qr_size >= 10:
+                    qr_x = cx + (cw - qr_size) / 2
+                    qr_y = cy + (ch - qr_size) / 2
+                    _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
             else:
-                # Legacy: size_rel scales inside the cell
+                # Legacy behavior: size is a fraction of the cell (not fitted)
                 size_rel = float(qr_cfg.get("size_rel", 0.85))
                 size_rel = max(0.2, min(0.95, size_rel))
                 base = min(cw, ch)
                 qr_size = max(10, min(base * size_rel, cw, ch))
                 qr_x = cx + (cw - qr_size) / 2
                 qr_y = cy + (ch - qr_size) / 2
-
-            _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
+                _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
 
     c.setFont(t.font_name, t.font_size)

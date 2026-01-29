@@ -1168,7 +1168,7 @@ def _default_layout_for_template(tpl_path: Path) -> dict:
             {"source": "label_line1", "style": "bold", "size": base_size, "pos": "UL", "align": "left", "wrap": False, "max_lines": 1},
             {"source": "vendor_sku", "style": "normal", "size": base_size, "pos": "LL", "align": "left", "wrap": False, "max_lines": 1},
         ],
-        "qr": {"enabled": True, "source": "purchase_url", "pos": "UR", "size_rel": 0.45},
+        "qr": {"enabled": True, "source": "purchase_url", "pos": "UR", "span": 1, "span_y": 1, "fit": False, "pad_rel": 0.06, "size_rel": 0.45},
     }
 
 
@@ -1284,45 +1284,57 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
 
 def _edit_qr(layout: dict) -> None:
     qr_cfg = dict(layout.get("qr", {}) or {})
+
     enabled = Confirm.ask("QR enabled?", default=bool(qr_cfg.get("enabled", True)))
     qr_cfg["enabled"] = enabled
-    if enabled:
-        # pick source
-        t = Table(show_header=True, header_style="bold magenta")
-        t.add_column("#", justify="right", width=3)
-        t.add_column("source")
-        for i, (k, _) in enumerate(LABEL_SOURCES, 1):
-            t.add_row(str(i), k)
-        console.print("\n[bold]QR source[/bold]")
-        console.print(t)
-        src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
-        pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
+    if not enabled:
+        layout["qr"] = qr_cfg
+        return
 
-        # Optional span: let the QR occupy 1..3 columns in the same 3x3 grid used by text.
-        span = IntPrompt.ask("QR span columns (1–3)", default=int(qr_cfg.get("span", qr_cfg.get("span_x", 1)) or 1))
-        span = max(1, min(3, int(span)))
+    # pick source (allow # or name)
+    t = Table(show_header=True, header_style="bold magenta")
+    t.add_column("#", justify="right", width=3)
+    t.add_column("source")
+    for i, (k, _) in enumerate(LABEL_SOURCES, 1):
+        t.add_row(str(i), k)
+    console.print("[bold]QR source[/bold]")
+    console.print(t)
 
-        # Fit-to-cell makes the QR as large as possible inside its (possibly spanned) cell with padding.
-        default_fit = bool(qr_cfg.get("fit", False)) or ("pad_rel" in qr_cfg) or span > 1
-        fit = Confirm.ask("Fit QR to cell/span?", default=default_fit)
-
-        if fit:
-            pad_rel = FloatPrompt.ask(
-                "QR padding (fraction of cell) 0.00–0.25",
-                default=float(qr_cfg.get("pad_rel", 0.06)),
-            )
-            pad_rel = max(0.0, min(0.25, float(pad_rel)))
-            qr_cfg.update({"source": src, "pos": pos, "span": span, "fit": "cell", "pad_rel": pad_rel})
-            # Keep size_rel as a legacy fallback (not used when fit='cell').
-            qr_cfg.setdefault("size_rel", float(qr_cfg.get("size_rel", 0.85)))
+    src_raw = Prompt.ask("QR source (# or name)", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
+    if src_raw.isdigit():
+        i = int(src_raw)
+        if 1 <= i <= len(LABEL_SOURCES):
+            src = LABEL_SOURCES[i - 1][0]
         else:
-            size_rel = FloatPrompt.ask("QR size (0.2–0.95)", default=float(qr_cfg.get("size_rel", 0.85)))
-            size_rel = max(0.2, min(0.95, float(size_rel)))
-            # Remove fit options if user turns fit off.
-            qr_cfg.pop("fit", None)
-            qr_cfg.pop("pad_rel", None)
-            qr_cfg.pop("pad", None)
-            qr_cfg.update({"source": src, "pos": pos, "span": span, "size_rel": size_rel})
+            src = "purchase_url"
+    else:
+        src = src_raw
+
+    pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
+
+    # span across the template grid (X = columns, Y = rows)
+    span = IntPrompt.ask("QR span columns (1–3)", default=int(qr_cfg.get("span", 1)))
+    span = max(1, min(3, int(span)))
+
+    span_y = IntPrompt.ask("QR span rows (1–3)", default=int(qr_cfg.get("span_y", 1)))
+    span_y = max(1, min(3, int(span_y)))
+
+    fit = Confirm.ask("Fit QR to spanned cell?", default=bool(qr_cfg.get("fit", False)))
+
+    qr_cfg.update({"source": src, "pos": pos, "span": span, "span_y": span_y, "fit": fit})
+
+    if fit:
+        pad_rel = FloatPrompt.ask("QR padding (fraction, 0.00–0.15)", default=float(qr_cfg.get("pad_rel", 0.06)))
+        pad_rel = max(0.0, min(0.15, float(pad_rel)))
+        qr_cfg["pad_rel"] = pad_rel
+        # keep size_rel as fallback if fit is turned off later
+        if "size_rel" not in qr_cfg:
+            qr_cfg["size_rel"] = 0.45
+    else:
+        size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
+        size_rel = max(0.2, min(0.9, float(size_rel)))
+        qr_cfg["size_rel"] = size_rel
+
     layout["qr"] = qr_cfg
 
 
@@ -1356,8 +1368,9 @@ def _layout_summary(layout: dict) -> None:
     console.print(
         f"[dim]QR: enabled={qr_cfg.get('enabled', False)} "
         f"source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} "
-        f"span={qr_cfg.get('span', qr_cfg.get('span_x',''))} "
-        f"fit={qr_cfg.get('fit','')} pad_rel={qr_cfg.get('pad_rel','')} size_rel={qr_cfg.get('size_rel','')}[/dim]"
+        f"span={qr_cfg.get('span', 1)} span_y={qr_cfg.get('span_y', 1)} "
+        f"fit={qr_cfg.get('fit', False)} "
+        f"pad_rel={qr_cfg.get('pad_rel','')} size_rel={qr_cfg.get('size_rel','')}[/dim]"
     )
 
 
