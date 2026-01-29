@@ -84,6 +84,7 @@ def make_labels_pdf(
     rows: list[dict],
     start_pos: int = 1,
     include_qr: bool = False,
+    draw_boxes: bool = False,
 ) -> None:
     """
     rows: list of dicts with keys like:
@@ -106,8 +107,9 @@ def make_labels_pdf(
             c.setFont(t.font_name, t.font_size)
 
         x0, y0 = _label_xy(t, page_pos)
-        # DEBUG: outline label box
-        c.rect(x0, y0, t.label_w, t.label_h, stroke=1, fill=0)
+        # Optional: outline label box (debug alignment)
+        if draw_boxes:
+            c.rect(x0, y0, t.label_w, t.label_h, stroke=1, fill=0)
 
         # padding box
         x = x0 + t.pad_x

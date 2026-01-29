@@ -7,6 +7,7 @@ from typing import Iterable, Optional
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
 
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
@@ -84,12 +85,15 @@ def make_labels_pdf(
     rows: list[dict],
     start_pos: int = 1,
     include_qr: bool = False,
+    layout: Optional[dict] = None,
     draw_boxes: bool = False,
 ) -> None:
     """
-    rows: list of dicts with keys like:
-      label_line1, label_line2, label_short, purchase_url, label_qr_text, part_key
-    start_pos: 1-based label position on sheet (Avery style). 1 = first label top-left.
+    Generate label sheets.
+    - rows: list of dicts with keys like: vendor, sku, label_line1, label_short, purchase_url, label_qr_text, part_key
+    - start_pos: 1-based label position on sheet; 1 = first label top-left.
+    - layout: optional layout preset dict (elements + qr settings)
+    - draw_boxes: if True, outlines each label (calibration/debug)
     """
     t = LabelTemplate.from_json(template_path)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +111,6 @@ def make_labels_pdf(
             c.setFont(t.font_name, t.font_size)
 
         x0, y0 = _label_xy(t, page_pos)
-        # Optional: outline label box (debug alignment)
         if draw_boxes:
             c.rect(x0, y0, t.label_w, t.label_h, stroke=1, fill=0)
 
@@ -117,40 +120,196 @@ def make_labels_pdf(
         w = t.label_w - 2 * t.pad_x
         h = t.label_h - 2 * t.pad_y
 
-        # Choose what to print (simple + reliable)
-        line1 = (item.get("label_line1") or item.get("label_short") or item.get("part_key") or "").strip()
-        line2 = (item.get("label_line2") or f'{item.get("vendor", "")}:{item.get("sku", "")}' or "").strip()
+        if layout:
+            _render_layout(c, item, x, y, w, h, t, layout)
+        else:
+            # fallback simple layout
+            line1 = (item.get("label_line1") or item.get("label_short") or item.get("part_key") or "").strip()
+            line2 = (item.get("label_line2") or f'{item.get("vendor", "")}:{item.get("sku", "")}' or "").strip()
+            qr_text = (item.get("label_qr_text") or item.get("purchase_url") or item.get("part_key") or "").strip()
 
-        # Do NOT print URL text line at all
-        line3 = ""
+            cur_y = y + h - t.font_size
+            for s in [line1, line2]:
+                if s:
+                    c.drawString(x, cur_y, _truncate_to_width(s, w, t.font_name, t.font_size))
+                    cur_y -= (t.font_size + 1)
 
-        qr_text = (item.get("label_qr_text") or item.get("purchase_url") or item.get("part_key") or "").strip()
-
-        # Layout: 2–3 lines left, optional QR right
-        text_left_w = w
-        qr_size = 0.0
-        if include_qr and qr_text:
-            qr_size = min(h, w * 0.45)
-            text_left_w = w - qr_size - (0.06 * inch)
-
-        # Write lines (top-down)
-        cur_y = y + h - t.font_size
-        for s in [line1, line2]:
-            if s:
-                c.drawString(x, cur_y, s[:22])
-                cur_y -= (t.font_size + 1)
-
-        if line3:
-            # smaller for URL-ish
-            c.setFont(t.font_name, max(6, t.font_size - 1))
-            c.drawString(x, max(y, cur_y), line3[:70])
-            c.setFont(t.font_name, t.font_size)
-
-        if include_qr and qr_text:
-            qr_x = x0 + t.label_w - t.pad_x - qr_size
-            qr_y = y + (h - qr_size) / 2
-            _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
+            if include_qr and qr_text:
+                qr_size = min(h, w * 0.45)
+                qr_x = x0 + t.label_w - t.pad_x - qr_size
+                qr_y = y + (h - qr_size) / 2
+                _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
 
         pos += 1
 
     c.save()
+
+
+def _font_for_style(base_font: str, style: str) -> str:
+    style = (style or "normal").lower()
+    if base_font.lower().startswith("helvetica"):
+        return {
+            "normal": "Helvetica",
+            "bold": "Helvetica-Bold",
+            "italic": "Helvetica-Oblique",
+            "bolditalic": "Helvetica-BoldOblique",
+        }.get(style, "Helvetica")
+    return base_font
+
+
+def _source_value(item: dict, source: str) -> str:
+    source = (source or "").strip()
+    if source == "vendor_sku":
+        v = (item.get("vendor") or "").strip()
+        s = (item.get("sku") or "").strip()
+        if v and s:
+            return f"{v}:{s}"
+        return s or v
+    if source in ("on_hand", "avg_unit_cost"):
+        val = item.get(source, "")
+        return "" if val is None else str(val)
+    val = item.get(source, "")
+    return "" if val is None else str(val)
+
+
+def _truncate_to_width(text: str, max_width: float, font: str, size: int) -> str:
+    if not text:
+        return ""
+    if pdfmetrics.stringWidth(text, font, size) <= max_width:
+        return text
+    ell = "…"
+    t = text
+    while t and pdfmetrics.stringWidth(t + ell, font, size) > max_width:
+        t = t[:-1]
+    return (t + ell) if t else ""
+
+
+def _wrap_lines(text: str, max_width: float, font: str, size: int, max_lines: int) -> list[str]:
+    if not text:
+        return []
+    words = text.split()
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if pdfmetrics.stringWidth(test, font, size) <= max_width or not cur:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+            if len(lines) >= max_lines:
+                break
+    if len(lines) < max_lines and cur:
+        lines.append(cur)
+    if lines:
+        lines[-1] = _truncate_to_width(lines[-1], max_width, font, size)
+    return lines[:max_lines]
+
+
+def _anchor_xy(pos: str, x: float, y: float, w: float, h: float) -> tuple[float, float, str]:
+    pos = (pos or "UL").upper()
+    row = pos[0]
+    col = pos[1]
+    if row == "U":
+        y0 = y + h
+        v = "top"
+    elif row == "M":
+        y0 = y + h / 2
+        v = "mid"
+    else:
+        y0 = y
+        v = "bot"
+
+    if col == "L":
+        x0 = x
+        hc = "left"
+    elif col == "C":
+        x0 = x + w / 2
+        hc = "center"
+    else:
+        x0 = x + w
+        hc = "right"
+    return x0, y0, f"{v}-{hc}"
+
+
+def _draw_aligned(c: canvas.Canvas, align: str, x: float, y: float, text: str) -> None:
+    align = (align or "left").lower()
+    if align == "center":
+        c.drawCentredString(x, y, text)
+    elif align == "right":
+        c.drawRightString(x, y, text)
+    else:
+        c.drawString(x, y, text)
+
+
+def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h: float, t: LabelTemplate, layout: dict) -> None:
+    elems = layout.get("elements", []) or []
+    qr_cfg = layout.get("qr", {}) or {}
+    qr_enabled = bool(qr_cfg.get("enabled", False))
+
+    for e in elems:
+        source = e.get("source", "")
+        text = _source_value(item, source).strip()
+        if not text:
+            continue
+
+        style = e.get("style", "normal")
+        size = int(e.get("size", t.font_size))
+        pos = e.get("pos", "UL")
+        align = e.get("align", "left")
+        wrap = bool(e.get("wrap", False))
+        max_lines = int(e.get("max_lines", 1))
+
+        font = _font_for_style(t.font_name, style)
+        c.setFont(font, size)
+
+        max_w = w
+        lines = _wrap_lines(text, max_w, font, size, max_lines) if wrap else [_truncate_to_width(text, max_w, font, size)]
+
+        leading = max(1, int(size * 1.15))
+        ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
+
+        if anchor.startswith("top"):
+            cur_y = ay - size
+            for ln in lines:
+                _draw_aligned(c, align, ax, cur_y, ln)
+                cur_y -= leading
+
+        elif anchor.startswith("mid"):
+            total_h = len(lines) * leading
+            cur_y = ay + (total_h / 2) - size
+            for ln in lines:
+                _draw_aligned(c, align, ax, cur_y, ln)
+                cur_y -= leading
+
+        else:
+            for i, ln in enumerate(lines):
+                yy = (y + size) + (len(lines) - 1 - i) * leading
+                _draw_aligned(c, align, ax, yy, ln)
+
+    if qr_enabled:
+        qr_source = qr_cfg.get("source", "purchase_url")
+        qr_text = _source_value(item, qr_source).strip()
+        if qr_text:
+            size_rel = float(qr_cfg.get("size_rel", 0.45))
+            qr_size = max(10, min(w, h) * max(0.2, min(0.9, size_rel)))
+            pos = qr_cfg.get("pos", "UR")
+            ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
+
+            if anchor.startswith("top"):
+                qr_y = (y + h) - qr_size
+            elif anchor.startswith("mid"):
+                qr_y = (y + h/2) - qr_size/2
+            else:
+                qr_y = y
+
+            if anchor.endswith("left"):
+                qr_x = x
+            elif anchor.endswith("center"):
+                qr_x = (x + w/2) - qr_size/2
+            else:
+                qr_x = (x + w) - qr_size
+
+            _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
+
+    c.setFont(t.font_name, t.font_size)

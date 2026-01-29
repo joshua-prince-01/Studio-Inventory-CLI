@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Any
 from uuid import uuid4
 
 import csv
+import json
+import os
 import subprocess
 import sys
 
@@ -17,7 +19,6 @@ from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
 from art_studio_org.db import DB, default_db_path, project_root
-from art_studio_org.vendors.mcmaster_api import McMasterClient, McMasterCreds
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -53,6 +54,32 @@ def shorten(s: str, n: int = 54) -> str:
     s = safe_str(s)
     return s if len(s) <= n else s[: n - 1] + "…"
 
+
+def parse_row_spec(spec: str) -> list[int]:
+    """
+    Parse "87:200,205,206" into 1-based row numbers (inclusive ranges).
+    """
+    out: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            a, b = part.split(":", 1)
+            a, b = int(a), int(b)
+            lo, hi = (a, b) if a <= b else (b, a)
+            out.extend(range(lo, hi + 1))
+        else:
+            out.append(int(part))
+
+    seen = set()
+    uniq: list[int] = []
+    for n in out:
+        if n not in seen:
+            uniq.append(n)
+            seen.add(n)
+    return uniq
+
 def exports_dir() -> Path:
     d = project_root() / "exports"
     d.mkdir(parents=True, exist_ok=True)
@@ -62,34 +89,6 @@ def timestamp_slug() -> str:
     # local time is fine for filenames
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def list_label_templates() -> list[Path]:
-    d = project_root() / "label_templates"
-    if not d.exists():
-        return []
-    return sorted(d.glob("*.json"))
-
-def pick_label_template() -> Path | None:
-    templates = list_label_templates()
-    if not templates:
-        console.print("[red]No templates found in label_templates/*.json[/red]")
-        pause()
-        return None
-
-    console.print("[bold]Choose template[/bold]\n")
-    t = Table(show_header=True, header_style="bold magenta")
-    t.add_column("#", justify="right", width=3)
-    t.add_column("file")
-    for i, p in enumerate(templates, 1):
-        t.add_row(str(i), p.name)
-    console.print(t)
-
-    choice = IntPrompt.ask("Template #", default=1)
-    if not (1 <= choice <= len(templates)):
-        console.print("[red]Invalid choice[/red]")
-        pause()
-        return None
-
-    return templates[choice - 1]
 
 # ----------------------------
 # Legacy ingest runner (subprocess)
@@ -401,56 +400,6 @@ def menu_inventory():
 def inv_list(db: DB):
         inv_browse(db, title="Inventory (all)", order_by="vendor, sku")
 
-def parse_row_spec(spec: str) -> list[int]:
-    """
-    Parse "87:200,205,206" into 1-based row numbers (inclusive ranges).
-    """
-    out: list[int] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" in part:
-            a, b = part.split(":", 1)
-            a, b = int(a), int(b)
-            lo, hi = (a, b) if a <= b else (b, a)
-            out.extend(range(lo, hi + 1))
-        else:
-            out.append(int(part))
-
-    # de-dupe preserving order
-    seen = set()
-    uniq: list[int] = []
-    for n in out:
-        if n not in seen:
-            uniq.append(n)
-            seen.add(n)
-    return uniq
-
-
-def fetch_parts_received_for_part_keys(db: DB, part_keys: list[str]) -> list[dict]:
-    """
-    Fetch label-relevant fields from parts_received for a list of part_keys,
-    preserving the order of part_keys.
-    """
-    if not part_keys:
-        return []
-
-    qmarks = ",".join(["?"] * len(part_keys))
-    got = db.rows(
-        f"""
-        SELECT
-            part_key, vendor, sku,
-            label_line1, label_line2, label_short,
-            purchase_url, label_qr_text
-        FROM parts_received
-        WHERE part_key IN ({qmarks})
-        """,
-        part_keys,
-    )
-    by_key = {r["part_key"]: dict(r) for r in got}
-    return [by_key[k] for k in part_keys if k in by_key]
-
 def inv_browse(
     db: DB,
     where_sql: str | None = None,
@@ -458,68 +407,49 @@ def inv_browse(
     title: str = "Inventory browse",
     order_by: str = "vendor, sku",
     allow_select: bool = False,
-):
+) -> Any:
     """
     Paged browser for inventory_view.
-
-    Commands:
-      n / p / g / s  : paging
-      v / h / c / o  : sort (vendor / on_hand / cost / last_invoice)
-      f              : filter (vendor/sku/label_short/description + thresholds)
-      <row#>         : open details
-      sel 87:200,205 : (when allow_select=True) return selected part_keys
-      q              : back
+    - where_sql: e.g. "WHERE vendor LIKE ? OR sku LIKE ?"
+    - params: matching parameters for where_sql
+    When allow_select=True, user can type: sel 87:200,205,206
+    and this function returns a dict describing the selection context.
     """
     params = params or []
     page_sizes = [10, 25, 50, 100]
     page_size = 25
     page = 1
 
-    base_where_sql = where_sql.strip() if where_sql else ""
-    if base_where_sql and not base_where_sql.lower().lstrip().startswith("where"):
-        base_where_sql = "WHERE " + base_where_sql
+    base_where = f" {where_sql} " if where_sql else ""
+    dyn_where = ""          # additional WHERE/AND clauses
+    dyn_params: list = []   # params for dyn_where
 
-    # dynamic filter state (set via 'f')
-    dyn_clause = ""
-    dyn_params: list = []
-
-    def combined_where() -> tuple[str, list]:
-        if base_where_sql and dyn_clause:
-            return f"{base_where_sql} AND ({dyn_clause})", params + dyn_params
-        if base_where_sql:
-            return base_where_sql, params
-        if dyn_clause:
-            return f"WHERE {dyn_clause}", dyn_params
-        return "", []
+    def _combined_where() -> str:
+        if not dyn_where.strip():
+            return base_where
+        if base_where.strip():
+            # base_where is expected to include WHERE ...
+            return base_where.rstrip() + " AND " + dyn_where.strip() + " "
+        return " WHERE " + dyn_where.strip() + " "
 
     def total_rows() -> int:
-        wh, p = combined_where()
-        return int(db.scalar(f"SELECT COUNT(*) FROM inventory_view {wh}", p) or 0)
+        return int(
+            db.scalar(
+                f"SELECT COUNT(*) FROM inventory_view{_combined_where()}",
+                params + dyn_params
+            ) or 0
+        )
 
-    def fetch_page(pageno: int, ps: int):
-        wh, p = combined_where()
-        offset = (pageno - 1) * ps
+    def fetch_page(p: int, ps: int):
+        offset = (p - 1) * ps
         sql = f"""
             SELECT part_key, vendor, sku, label_short, on_hand, avg_unit_cost, last_invoice
             FROM inventory_view
-            {wh}
+            {_combined_where()}
             ORDER BY {order_by}
             LIMIT ? OFFSET ?
         """
-        return db.rows(sql, p + [ps, offset])
-
-    def fetch_all_part_keys() -> list[str]:
-        wh, p = combined_where()
-        rows = db.rows(
-            f"""
-            SELECT part_key
-            FROM inventory_view
-            {wh}
-            ORDER BY {order_by}
-            """,
-            p,
-        )
-        return [r["part_key"] for r in rows]
+        return db.rows(sql, params + dyn_params + [ps, offset])
 
     while True:
         console.clear()
@@ -539,8 +469,8 @@ def inv_browse(
 
         t = Table(show_header=True, header_style="bold magenta")
         t.add_column("#", justify="right", style="dim", width=4)
-        t.add_column("vendor", width=14)
-        t.add_column("sku", width=22)
+        t.add_column("vendor", width=10)
+        t.add_column("sku", width=14)
         t.add_column("label_short")
         t.add_column("on_hand", justify="right", width=8)
         t.add_column("avg_cost", justify="right", width=10)
@@ -558,26 +488,20 @@ def inv_browse(
 
         console.print(t)
 
-        # status + commands
         cmd_line = (
             f"\nPage [cyan]{page}[/cyan] / [cyan]{max_page}[/cyan]  |  "
             f"Rows: [cyan]{total}[/cyan]  |  Page size: [cyan]{page_size}[/cyan]  |  "
-            f"Sort: [cyan]{order_by}[/cyan]"
-        )
-        console.print(cmd_line)
-
-        cmds = (
+            f"Sort: [cyan]{order_by}[/cyan]\n"
             "[dim]Commands:[/dim] "
             "[bold]n[/bold] next  [bold]p[/bold] prev  [bold]g[/bold] goto  "
             "[bold]s[/bold] size  "
-            "[bold]v[/bold] sort-vendor  [bold]h[/bold] sort-on_hand  "
-            "[bold]c[/bold] sort-cost  [bold]o[/bold] sort-last_invoice  "
+            "[bold]v[/bold] vendor  [bold]h[/bold] on_hand  [bold]c[/bold] cost  [bold]o[/bold] last_invoice  "
             "[bold]f[/bold] filter  "
             "[bold]q[/bold] back  [bold]<row#>[/bold] details"
         )
         if allow_select:
-            cmds += "  [bold]sel 87:200,205[/bold] select"
-        console.print(cmds)
+            cmd_line += "  [bold]sel <spec>[/bold] select rows"
+        console.print(cmd_line)
 
         cmd = Prompt.ask(">", default="n").strip()
         cmd_l = cmd.lower()
@@ -588,11 +512,14 @@ def inv_browse(
         elif cmd_l == "n":
             if page < max_page:
                 page += 1
+
         elif cmd_l == "p":
             if page > 1:
                 page -= 1
+
         elif cmd_l == "g":
             page = IntPrompt.ask("Go to page", default=page)
+
         elif cmd_l == "s":
             page_size = IntPrompt.ask(f"Page size {page_sizes}", default=page_size)
             if page_size not in page_sizes:
@@ -603,80 +530,76 @@ def inv_browse(
         elif cmd_l == "v":
             order_by = "vendor, sku"
             page = 1
+
         elif cmd_l == "h":
             order_by = "on_hand DESC, vendor, sku"
             page = 1
+
         elif cmd_l == "c":
             order_by = "avg_unit_cost DESC, vendor, sku"
             page = 1
+
         elif cmd_l == "o":
-            order_by = "last_invoice DESC, vendor, sku"
+            order_by = "last_invoice DESC"
             page = 1
 
-        # filter builder
+        # filters
         elif cmd_l == "f":
-            console.print("\n[bold]Filter[/bold] (blank = no filter for that field)")
-
-            vendor_s = Prompt.ask("Vendor contains", default="").strip()
-            term_s = Prompt.ask("Search term (sku/label_short/description)", default="").strip()
-            min_on_hand_s = Prompt.ask("Min on_hand", default="").strip()
-            max_cost_s = Prompt.ask("Max avg_cost", default="").strip()
-            invoice_s = Prompt.ask("Last invoice contains", default="").strip()
+            console.print("\n[bold]Filter inventory (blank clears each field)[/bold]")
+            vendor_f = Prompt.ask("Vendor contains", default="").strip()
+            term_f = Prompt.ask("Search term (sku/label_short)", default="").strip()
+            min_hand = Prompt.ask("Min on_hand", default="").strip()
+            max_cost = Prompt.ask("Max avg_cost", default="").strip()
+            inv_term = Prompt.ask("Last invoice contains", default="").strip()
 
             clauses = []
-            new_params = []
+            new_params: list = []
 
-            if vendor_s:
+            if vendor_f:
                 clauses.append("vendor LIKE ?")
-                new_params.append(f"%{vendor_s}%")
-            if term_s:
-                clauses.append("(sku LIKE ? OR label_short LIKE ? OR description LIKE ?)")
-                like = f"%{term_s}%"
-                new_params.extend([like, like, like])
-            if invoice_s:
-                clauses.append("last_invoice LIKE ?")
-                new_params.append(f"%{invoice_s}%")
-            if min_on_hand_s:
+                new_params.append(f"%{vendor_f}%")
+            if term_f:
+                clauses.append("(sku LIKE ? OR label_short LIKE ?)")
+                new_params.extend([f"%{term_f}%", f"%{term_f}%"])
+            if min_hand:
                 try:
-                    clauses.append("CAST(on_hand AS REAL) >= ?")
-                    new_params.append(float(min_on_hand_s))
+                    clauses.append("on_hand >= ?")
+                    new_params.append(float(min_hand))
                 except ValueError:
                     console.print("[yellow]Min on_hand ignored (not a number).[/yellow]")
-            if max_cost_s:
+            if max_cost:
                 try:
                     clauses.append("avg_unit_cost <= ?")
-                    new_params.append(float(max_cost_s))
+                    new_params.append(float(max_cost))
                 except ValueError:
                     console.print("[yellow]Max avg_cost ignored (not a number).[/yellow]")
+            if inv_term:
+                clauses.append("last_invoice LIKE ?")
+                new_params.append(f"%{inv_term}%")
 
-            dyn_clause = " AND ".join(clauses)
-            dyn_params = new_params
+            if clauses:
+                dyn_where = " AND ".join(clauses)
+                dyn_params = new_params
+            else:
+                dyn_where = ""
+                dyn_params = []
+
             page = 1
 
-        # selection
+        # selection mode
         elif allow_select and cmd_l.startswith("sel"):
             spec = cmd[3:].strip()
-            if not spec:
-                console.print("[yellow]Usage: sel 87:200,205,206[/yellow]")
-                pause()
-                continue
-
             row_nums = parse_row_spec(spec)
-            all_keys = fetch_all_part_keys()
+            return {
+                "row_nums": row_nums,
+                "base_where": base_where,
+                "base_params": params,
+                "dyn_where": dyn_where,
+                "dyn_params": dyn_params,
+                "order_by": order_by,
+            }
 
-            part_keys: list[str] = []
-            for n in row_nums:
-                if 1 <= n <= len(all_keys):
-                    part_keys.append(all_keys[n - 1])
-
-            if not part_keys:
-                console.print("[yellow]No valid rows selected.[/yellow]")
-                pause()
-                continue
-
-            return part_keys
-
-        # drill-in by absolute row number
+        # Drill-in by absolute row number
         elif cmd.isdigit():
             idx = int(cmd) - 1  # absolute row index (0-based)
             target_page = idx // page_size + 1
@@ -689,11 +612,6 @@ def inv_browse(
                 part_key = rows[target_offset]["part_key"]
                 inv_show(db, part_key=part_key)
             continue
-
-        else:
-            # ignore unknown commands
-            continue
-
 def inv_search(db: DB):
     console.clear()
     header()
@@ -716,7 +634,7 @@ def inv_search(db: DB):
         where_sql=where_sql,
         params=[like, like, like, like, like],
         title=f"Search: {term}",
-        order_by="vendor, sku",
+        order_by="on_hand DESC, vendor, sku",
     )
 
 
@@ -725,10 +643,10 @@ def inv_show(db: DB, part_key: str | None = None):
     header()
     console.print("[bold]Show inventory item[/bold]\n")
 
-    # Only prompt if caller didn't supply a part_key
     if part_key is None:
-        part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
+        part_key = Prompt.ask("part_key").strip()
 
+    part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
     if not part_key:
         return
 
@@ -762,15 +680,9 @@ def inv_show(db: DB, part_key: str | None = None):
         rt.add_column("project", width=18)
         rt.add_column("note")
         for rr in rem:
-            rt.add_row(
-                safe_str(rr["ts_utc"]),
-                safe_str(rr["qty_removed"]),
-                shorten(rr["project"], 18),
-                shorten(rr["note"], 60),
-            )
+            rt.add_row(safe_str(rr["ts_utc"]), safe_str(rr["qty_removed"]), shorten(rr["project"], 18), shorten(rr["note"], 60))
         console.print(rt)
 
-    # "Click out" back to browse
     Prompt.ask("\nPress Enter to go back", default="")
     return
 
@@ -991,172 +903,20 @@ def menu_db_diagnostics():
 # Future stubs
 # ----------------------------
 def menu_vendors():
-    while True:
-        console.clear()
-        header()
-        console.print("[bold]Vendors[/bold]\n")
-
-        menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "McMaster – enrich ONE part")
-        menu.add_row("2.", "McMaster – enrich missing (later)")
-        menu.add_row("0.", "Back")
-        console.print(menu)
-
-        choice = Prompt.ask("\nChoose", choices=["1", "2", "0"], default="1")
-        if choice == "0":
-            return
-        if choice == "1":
-            vendor_mcmaster_enrich_one()
-
-
-def vendor_mcmaster_enrich_one():
     console.clear()
     header()
-    console.print("[bold]McMaster enrich ONE[/bold]\n")
-
-    part_key = Prompt.ask("part_key (mcmaster:1234K56)").strip()
-    if not part_key.startswith("mcmaster:"):
-        console.print("[red]part_key must start with mcmaster:[/red]")
-        pause()
-        return
-
-    sku = part_key.split(":", 1)[1]
-    db = get_db()
-
-    try:
-        client = McMasterClient(McMasterCreds.from_env())
-        client.add_product(sku)
-        info = client.product_info(sku)
-
-        title = info.get("Title")
-        desc = info.get("Description")
-        url = info.get("ProductUrl")
-
-        image_url = None
-        for link in info.get("Links", []):
-            if link.get("Rel") == "Image":
-                image_url = link.get("Href")
-
-        specs = info.get("Specifications")
-
-        db.upsert_vendor_enrichment(
-            part_key=part_key,
-            vendor="mcmaster",
-            sku=sku,
-            source="mcmaster",
-            title=title,
-            description=desc,
-            product_url=url,
-            image_url=image_url,
-            specs_json=specs,
-            raw_json=info,
-        )
-
-        console.print("[green]Enriched and saved to vendor_enrichment.[/green]")
-    except Exception as e:
-        console.print(f"[red]Failed:[/red] {e}")
-
+    console.print("[bold]Vendors[/bold]\n")
+    console.print("Next: DigiKey OAuth + product/media enrichment, then McMaster cert-based API enrichment.")
     pause()
 
 
 def menu_labels():
-    db = get_db()
-
-    while True:
-        console.clear()
-        header()
-        console.print("[bold]Labels[/bold]\n")
-
-        menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Make labels PDF (from parts_received)")
-        menu.add_row("0.", "Back")
-        console.print(menu)
-
-        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="1")
-        if choice == "0":
-            return
-        if choice == "1":
-            labels_make_pdf(db)
-
-from art_studio_org.labels.make_pdf import make_labels_pdf
-from pathlib import Path
-
-def open_path_in_default_app(p: Path) -> None:
-    try:
-        if sys.platform.startswith("darwin"):
-            subprocess.Popen(["open", str(p)])
-        elif sys.platform.startswith("win"):
-            subprocess.Popen(["cmd", "/c", "start", "", str(p)])
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
-    except Exception:
-        # best-effort only
-        return
-
-
-def labels_make_pdf(db: DB):
     console.clear()
     header()
-    console.print("[bold]Make labels PDF[/bold]\n")
-
-    # template (pick from list)
-    tpl_path = pick_label_template()
-    if not tpl_path:
-        return
-
-    console.print("[bold]Select items from inventory[/bold]")
-    console.print("[dim]Use sort keys (v/h/c/o), filter (f), then select: sel 87:200,205,206[/dim]\n")
-
-    part_keys = inv_browse(
-        db,
-        title="Inventory (select rows for labels)",
-        order_by="vendor, sku",
-        allow_select=True,
-    )
-    if not part_keys:
-        return
-
-    rows = fetch_parts_received_for_part_keys(db, part_keys)
-    if not rows:
-        console.print("[yellow]No items found for selection.[/yellow]")
-        pause()
-        return
-
-    start_pos = IntPrompt.ask("Start label position (1 = first label top-left)", default=1)
-    include_qr = Confirm.ask("Include QR code?", default=True)
-
-    outdir = exports_dir()
-    preview_pdf = outdir / "_labels_preview.pdf"
-
-    make_labels_pdf(
-        template_path=tpl_path,
-        out_pdf=preview_pdf,
-        rows=rows,
-        start_pos=start_pos,
-        include_qr=include_qr,
-        draw_boxes=False,
-    )
-
-    console.print(f"Preview written: [cyan]{preview_pdf}[/cyan]")
-    open_path_in_default_app(preview_pdf)
-
-    if not Confirm.ask("Export final PDF?", default=False):
-        console.print("[yellow]Not exported. Preview kept.[/yellow]")
-        pause()
-        return
-
-    out_pdf = outdir / f"labels_{timestamp_slug()}.pdf"
-    make_labels_pdf(
-        template_path=tpl_path,
-        out_pdf=out_pdf,
-        rows=rows,
-        start_pos=start_pos,
-        include_qr=include_qr,
-        draw_boxes=False,
-    )
-
-    console.print(f"[green]Wrote[/green] {out_pdf}")
+    console.print("[bold]Labels[/bold]\n")
+    console.print("Paused for now. Once vendor enrichment is in, labels become DB-driven.")
     pause()
+
 
 # ----------------------------
 # Placeholder subcommands
