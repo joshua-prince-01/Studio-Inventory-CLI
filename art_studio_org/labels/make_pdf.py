@@ -14,28 +14,6 @@ from reportlab.graphics.shapes import Drawing
 from reportlab.graphics import renderPDF
 
 
-# Keep in sync with CLI LABEL_SOURCES (keys only). Allows older presets to use numeric indices.
-_LABEL_SOURCE_KEYS = [
-    "label_line1",
-    "label_line2",
-    "label_short",
-    "vendor",
-    "sku",
-    "vendor_sku",
-    "purchase_url",
-    "label_qr_text",
-    "part_key",
-]
-
-
-def _normalize_source_token(token: object) -> str:
-    t = str(token).strip()
-    if t.isdigit():
-        i = int(t)
-        if 1 <= i <= len(_LABEL_SOURCE_KEYS):
-            return _LABEL_SOURCE_KEYS[i - 1]
-    return t
-
 @dataclass
 class LabelTemplate:
     name: str
@@ -98,6 +76,28 @@ def _draw_qr(c: canvas.Canvas, x: float, y: float, size: float, text: str) -> No
     d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
     d.add(code)
     renderPDF.draw(d, c, x, y)
+
+
+def _fit_square_in_rect(
+    cx: float,
+    cy: float,
+    cw: float,
+    ch: float,
+    *,
+    pad_rel: float = 0.0,
+    pad_abs: float = 0.0,
+) -> tuple[float, float, float]:
+    """Return (qx, qy, qsize) for a square centered inside a rectangle.
+
+    - pad_rel: fraction of min(cw,ch)
+    - pad_abs: absolute padding in points
+    """
+    base = max(0.0, min(float(cw), float(ch)))
+    pad = max(0.0, float(pad_abs), float(pad_rel) * base)
+    size = max(0.0, base - 2.0 * pad)
+    qx = cx + (cw - size) / 2.0
+    qy = cy + (ch - size) / 2.0
+    return qx, qy, size
 
 
 def make_labels_pdf(
@@ -180,7 +180,7 @@ def _font_for_style(base_font: str, style: str) -> str:
 
 
 def _source_value(item: dict, source: str) -> str:
-    source = _normalize_source_token(source)
+    source = (source or "").strip()
     if source == "vendor_sku":
         v = (item.get("vendor") or "").strip()
         s = (item.get("sku") or "").strip()
@@ -357,20 +357,37 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
         qr_source = qr_cfg.get("source", "purchase_url")
         qr_text = _source_value(item, qr_source).strip()
         if qr_text:
-            size_rel = float(qr_cfg.get("size_rel", 0.45))
-            qr_size = max(10, min(w, h) * max(0.2, min(0.9, size_rel)))
+            # QR lives in the same 3x3 grid system as text elements.
+            # Add optional spanning + auto-fit so QR can fill the cell (or spanned cell)
+            # with a small padding.
             pos = qr_cfg.get("pos", "UR")
-            cx, cy, cw, ch, _row = _cell_box(pos, x, y, w, h)
+            span_x = int(qr_cfg.get("span", qr_cfg.get("span_x", 1)) or 1)
+            span_y = int(qr_cfg.get("span_y", 1) or 1)
+            span_x = max(1, min(3, span_x))
+            span_y = max(1, min(3, span_y))
 
-            base = min(cw, ch)
-            size_rel = float(qr_cfg.get("size_rel", 0.85))
-            size_rel = max(0.2, min(0.95, size_rel))
+            cx, cy, cw, ch, _row = _cell_box(pos, x, y, w, h, span_x=span_x, span_y=span_y)
 
-            qr_size = base * size_rel
-            qr_size = max(10, min(qr_size, cw, ch))  # keep inside the cell
-
-            qr_x = cx + (cw - qr_size) / 2
-            qr_y = cy + (ch - qr_size) / 2
+            # New behavior: if fit='cell' (or pad_rel/pad is provided), fit QR to the cell bounds.
+            # Otherwise, keep legacy size_rel behavior.
+            fit = qr_cfg.get("fit", "")
+            pad_rel = qr_cfg.get("pad_rel", None)
+            pad_abs = qr_cfg.get("pad", None)
+            if fit in (True, "cell") or pad_rel is not None or pad_abs is not None:
+                pr = 0.06 if pad_rel is None else float(pad_rel)
+                pr = max(0.0, min(0.25, pr))
+                pa = 0.0 if pad_abs is None else float(pad_abs)
+                pa = max(0.0, pa)
+                qr_x, qr_y, qr_size = _fit_square_in_rect(cx, cy, cw, ch, pad_rel=pr, pad_abs=pa)
+                qr_size = max(10, min(qr_size, cw, ch))
+            else:
+                # Legacy: size_rel scales inside the cell
+                size_rel = float(qr_cfg.get("size_rel", 0.85))
+                size_rel = max(0.2, min(0.95, size_rel))
+                base = min(cw, ch)
+                qr_size = max(10, min(base * size_rel, cw, ch))
+                qr_x = cx + (cw - qr_size) / 2
+                qr_y = cy + (ch - qr_size) / 2
 
             _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
 

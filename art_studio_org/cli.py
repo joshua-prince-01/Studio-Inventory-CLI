@@ -1049,34 +1049,6 @@ ALIGNS = ["left","center","right"]
 STYLES = ["normal","bold","italic"]
 
 
-def _normalize_label_source_token(token: object) -> str:
-    """Allow presets/inputs to refer to LABEL_SOURCES by 1-based index (e.g. '7')."""
-    t = str(token).strip()
-    if t.isdigit():
-        i = int(t)
-        if 1 <= i <= len(LABEL_SOURCES):
-            return LABEL_SOURCES[i - 1][0]
-    return t
-
-
-def _normalize_layout_sources(layout: dict) -> dict:
-    """Mutates layout in-place to normalize any numeric 'source' fields to real keys."""
-    if not isinstance(layout, dict):
-        return layout
-    # elements
-    elems = layout.get("elements", []) or []
-    for e in elems:
-        if isinstance(e, dict) and "source" in e:
-            e["source"] = _normalize_label_source_token(e.get("source", ""))
-    # qr
-    qr_cfg = layout.get("qr", {}) or {}
-    if isinstance(qr_cfg, dict) and "source" in qr_cfg:
-        qr_cfg["source"] = _normalize_label_source_token(qr_cfg.get("source", ""))
-    layout["qr"] = qr_cfg
-    layout["elements"] = elems
-    return layout
-
-
 def _open_pdf(path: Path) -> None:
     try:
         if sys.platform.startswith("darwin"):
@@ -1213,17 +1185,17 @@ def _pick_or_create_layout(tpl_path: Path) -> tuple[dict, str | None]:
         console.print("[dim]0 = start from default layout[/dim]")
         idx = IntPrompt.ask("Preset #", default=0)
         if idx == 0:
-            return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
+            return _default_layout_for_template(tpl_path), None
         if 1 <= idx <= len(presets):
             p = presets[idx - 1]
             try:
-                return _normalize_layout_sources(load_label_preset(p)), p.stem
+                return load_label_preset(p), p.stem
             except Exception:
-                return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
-        return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
+                return _default_layout_for_template(tpl_path), None
+        return _default_layout_for_template(tpl_path), None
     else:
         console.print("[dim]No presets yet. Starting from default.[/dim]")
-        return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
+        return _default_layout_for_template(tpl_path), None
 
 
 def _edit_elements(layout: dict, tpl_font_size: int) -> None:
@@ -1312,9 +1284,6 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
 
 def _edit_qr(layout: dict) -> None:
     qr_cfg = dict(layout.get("qr", {}) or {})
-    # Back-compat: some presets stored numeric sources like "7"
-    if "source" in qr_cfg:
-        qr_cfg["source"] = _normalize_label_source_token(qr_cfg.get("source", ""))
     enabled = Confirm.ask("QR enabled?", default=bool(qr_cfg.get("enabled", True)))
     qr_cfg["enabled"] = enabled
     if enabled:
@@ -1326,12 +1295,34 @@ def _edit_qr(layout: dict) -> None:
             t.add_row(str(i), k)
         console.print("\n[bold]QR source[/bold]")
         console.print(t)
-        src_in = Prompt.ask("QR source (# or name)", default=str(qr_cfg.get("source", "purchase_url"))).strip()
-        src = _normalize_label_source_token(src_in or qr_cfg.get("source", "purchase_url") or "purchase_url") or "purchase_url"
+        src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
         pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
-        size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
-        size_rel = max(0.2, min(0.9, float(size_rel)))
-        qr_cfg.update({"source": src, "pos": pos, "size_rel": size_rel})
+
+        # Optional span: let the QR occupy 1..3 columns in the same 3x3 grid used by text.
+        span = IntPrompt.ask("QR span columns (1–3)", default=int(qr_cfg.get("span", qr_cfg.get("span_x", 1)) or 1))
+        span = max(1, min(3, int(span)))
+
+        # Fit-to-cell makes the QR as large as possible inside its (possibly spanned) cell with padding.
+        default_fit = bool(qr_cfg.get("fit", False)) or ("pad_rel" in qr_cfg) or span > 1
+        fit = Confirm.ask("Fit QR to cell/span?", default=default_fit)
+
+        if fit:
+            pad_rel = FloatPrompt.ask(
+                "QR padding (fraction of cell) 0.00–0.25",
+                default=float(qr_cfg.get("pad_rel", 0.06)),
+            )
+            pad_rel = max(0.0, min(0.25, float(pad_rel)))
+            qr_cfg.update({"source": src, "pos": pos, "span": span, "fit": "cell", "pad_rel": pad_rel})
+            # Keep size_rel as a legacy fallback (not used when fit='cell').
+            qr_cfg.setdefault("size_rel", float(qr_cfg.get("size_rel", 0.85)))
+        else:
+            size_rel = FloatPrompt.ask("QR size (0.2–0.95)", default=float(qr_cfg.get("size_rel", 0.85)))
+            size_rel = max(0.2, min(0.95, float(size_rel)))
+            # Remove fit options if user turns fit off.
+            qr_cfg.pop("fit", None)
+            qr_cfg.pop("pad_rel", None)
+            qr_cfg.pop("pad", None)
+            qr_cfg.update({"source": src, "pos": pos, "span": span, "size_rel": size_rel})
     layout["qr"] = qr_cfg
 
 
@@ -1362,7 +1353,12 @@ def _layout_summary(layout: dict) -> None:
             str(e.get("max_lines", 1)),
         )
     console.print(t)
-    console.print(f"[dim]QR: enabled={qr_cfg.get('enabled', False)} source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} size_rel={qr_cfg.get('size_rel','')}[/dim]")
+    console.print(
+        f"[dim]QR: enabled={qr_cfg.get('enabled', False)} "
+        f"source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} "
+        f"span={qr_cfg.get('span', qr_cfg.get('span_x',''))} "
+        f"fit={qr_cfg.get('fit','')} pad_rel={qr_cfg.get('pad_rel','')} size_rel={qr_cfg.get('size_rel','')}[/dim]"
+    )
 
 
 def labels_generate(db: DB):

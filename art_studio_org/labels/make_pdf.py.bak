@@ -14,6 +14,28 @@ from reportlab.graphics.shapes import Drawing
 from reportlab.graphics import renderPDF
 
 
+# Keep in sync with CLI LABEL_SOURCES (keys only). Allows older presets to use numeric indices.
+_LABEL_SOURCE_KEYS = [
+    "label_line1",
+    "label_line2",
+    "label_short",
+    "vendor",
+    "sku",
+    "vendor_sku",
+    "purchase_url",
+    "label_qr_text",
+    "part_key",
+]
+
+
+def _normalize_source_token(token: object) -> str:
+    t = str(token).strip()
+    if t.isdigit():
+        i = int(t)
+        if 1 <= i <= len(_LABEL_SOURCE_KEYS):
+            return _LABEL_SOURCE_KEYS[i - 1]
+    return t
+
 @dataclass
 class LabelTemplate:
     name: str
@@ -158,7 +180,7 @@ def _font_for_style(base_font: str, style: str) -> str:
 
 
 def _source_value(item: dict, source: str) -> str:
-    source = (source or "").strip()
+    source = _normalize_source_token(source)
     if source == "vendor_sku":
         v = (item.get("vendor") or "").strip()
         s = (item.get("sku") or "").strip()
