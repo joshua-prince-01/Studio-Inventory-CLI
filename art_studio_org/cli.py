@@ -35,25 +35,6 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def ensure_inventory_events_table(db: DB) -> None:
-    # Unified audit log for manual receive/remove actions
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory_events (
-            event_uid   TEXT PRIMARY KEY,
-            ts_utc      TEXT NOT NULL,
-            event_type  TEXT NOT NULL,   -- 'receive' or 'remove'
-            part_key    TEXT NOT NULL,
-            qty         REAL NOT NULL,
-            unit_cost   REAL,
-            total_cost  REAL,
-            project     TEXT,
-            note        TEXT
-        )
-        """
-    )
-
-
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
@@ -680,8 +661,10 @@ def inv_show(db: DB, part_key: str | None = None):
     header()
     console.print("[bold]Show inventory item[/bold]\n")
 
-    if not part_key:
-        part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)", default="").strip()
+    if part_key is None:
+        part_key = Prompt.ask("part_key").strip()
+
+    part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
     if not part_key:
         return
 
@@ -697,50 +680,29 @@ def inv_show(db: DB, part_key: str | None = None):
         t.add_row(f"[dim]{k}[/dim]", safe_str(r[k]))
     console.print(t)
 
-    # Recent audit notes (if available)
-    try:
-        ev = db.rows(
-            "SELECT ts_utc, event_type, qty, unit_cost, project, note "
-            "FROM inventory_events WHERE part_key = ? ORDER BY ts_utc DESC LIMIT 10",
-            [part_key],
-        )
-        if ev:
-            console.print("\n[bold]Recent events[/bold]")
-            et = Table(show_header=True, header_style="bold cyan")
-            et.add_column("ts_utc", width=20)
-            et.add_column("type", width=8)
-            et.add_column("qty", justify="right", width=8)
-            et.add_column("unit_cost", justify="right", width=10)
-            et.add_column("project", width=16)
-            et.add_column("note")
-            for e in ev:
-                et.add_row(
-                    safe_str(e["ts_utc"]),
-                    safe_str(e["event_type"]),
-                    safe_str(e["qty"]),
-                    fmt_money(e["unit_cost"]),
-                    shorten(safe_str(e["project"]), 16),
-                    shorten(safe_str(e["note"]), 60),
-                )
-            console.print(et)
-    except Exception:
-        pass
+    console.print("\n[bold]Recent removals[/bold]")
+    rem = db.rows("""
+        SELECT ts_utc, qty_removed, project, note
+        FROM parts_removed
+        WHERE part_key = ?
+        ORDER BY ts_utc DESC
+        LIMIT 10
+    """, [part_key])
 
-    pause()
+    if not rem:
+        console.print("[dim](none)[/dim]")
+    else:
+        rt = Table(show_header=True, header_style="bold cyan")
+        rt.add_column("ts_utc", style="dim")
+        rt.add_column("qty_removed", justify="right", width=10)
+        rt.add_column("project", width=18)
+        rt.add_column("note")
+        for rr in rem:
+            rt.add_row(safe_str(rr["ts_utc"]), safe_str(rr["qty_removed"]), shorten(rr["project"], 18), shorten(rr["note"], 60))
+        console.print(rt)
 
-
-def pick_part_keys_from_browser(db: DB, title: str) -> list[str]:
-    console.clear()
-    header()
-    console.print(f"[bold]{title}[/bold]\n")
-    console.print("[dim]Use sort keys (v/h/c/o), filter (f), type a row # for details, then select: sel 205 or sel 87:200,205[/dim]\n")
-    sel = inv_browse(db, title=title, allow_select=True)
-    if not sel:
-        return []
-    return _fetch_selected_part_keys(db, sel)
-
-
-
+    Prompt.ask("\nPress Enter to go back", default="")
+    return
 
 
 def inv_remove(db: DB):
@@ -748,60 +710,35 @@ def inv_remove(db: DB):
     header()
     console.print("[bold]Remove stock[/bold] (logs to parts_removed)\n")
 
-    use_browser = Confirm.ask("Pick part(s) from inventory browser?", default=True)
-    if use_browser:
-        part_keys = pick_part_keys_from_browser(db, "Remove parts")
-        if not part_keys:
-            return
-    else:
-        pk = Prompt.ask("part_key").strip()
-        if not pk:
-            return
-        part_keys = [pk]
+    part_key = Prompt.ask("part_key").strip()
+    if not part_key:
+        return
 
-    qty = FloatPrompt.ask("Qty removed (applies to each selected item)", default=1.0)
+    exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
+    if not exists:
+        console.print("[red]part_key not found in parts_received.[/red]")
+        pause()
+        return
+
+    qty = FloatPrompt.ask("Qty removed", default=1.0)
     if qty <= 0:
         console.print("[yellow]Qty must be > 0[/yellow]")
         pause()
         return
 
     project = Prompt.ask("Project (optional)", default="").strip()
-    note = Prompt.ask("Note (why?) (optional)", default="").strip()
+    note = Prompt.ask("Note (optional)", default="").strip()
 
     ts = utc_now_iso()
-    ensure_inventory_events_table(db)
+    removal_uid = str(uuid4())
 
-    skipped = 0
-    for part_key in part_keys:
-        exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
-        if not exists:
-            skipped += 1
-            continue
-
-        removal_uid = str(uuid4())
-        db.execute(
-            """
-            INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [removal_uid, part_key, qty, ts, project, note, ts],
-        )
-
-        # Unified event log (qty negative for remove)
-        db.execute(
-            """
-            INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [str(uuid4()), ts, "remove", part_key, -qty, None, None, project, note],
-        )
-
-    if skipped:
-        console.print(f"[yellow]Skipped {skipped} item(s) not found in parts_received.[/yellow]")
+    db.execute("""
+        INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [removal_uid, part_key, qty, ts, project, note, ts])
 
     console.print("[green]Logged removal.[/green] inventory_view on_hand will update automatically.")
     pause()
-
 
 
 def inv_receive(db: DB):
@@ -809,18 +746,11 @@ def inv_receive(db: DB):
     header()
     console.print("[bold]Receive stock (manual)[/bold] (upserts parts_received)\n")
 
-    use_browser = Confirm.ask("Pick existing part(s) from inventory browser?", default=True)
-    if use_browser:
-        part_keys = pick_part_keys_from_browser(db, "Receive parts")
-        if not part_keys:
-            return
-    else:
-        pk = Prompt.ask("part_key (recommended format: vendor:sku)").strip()
-        if not pk:
-            return
-        part_keys = [pk]
+    part_key = Prompt.ask("part_key (recommended format: vendor:sku)").strip()
+    if not part_key:
+        return
 
-    qty = FloatPrompt.ask("Qty received (applies to each selected item)", default=1.0)
+    qty = FloatPrompt.ask("Qty received", default=1.0)
     if qty <= 0:
         console.print("[yellow]Qty must be > 0[/yellow]")
         pause()
@@ -832,93 +762,64 @@ def inv_receive(db: DB):
     except ValueError:
         unit_cost_f = 0.0
 
-    project = Prompt.ask("Project (optional)", default="").strip()
-    note = Prompt.ask("Note (why?) (optional)", default="").strip()
+    added_spend = qty * unit_cost_f
 
-    added_spend_each = qty * unit_cost_f
+    exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
     ts = utc_now_iso()
-    ensure_inventory_events_table(db)
 
-    for part_key in part_keys:
-        exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
+    if exists:
+        db.execute("""
+            UPDATE parts_received
+            SET
+              units_received = COALESCE(units_received, 0) + ?,
+              total_spend = COALESCE(total_spend, 0) + ?,
+              avg_unit_cost =
+                CASE
+                  WHEN (COALESCE(units_received, 0) + ?) > 0 AND (COALESCE(total_spend, 0) + ?) > 0
+                  THEN (COALESCE(total_spend, 0) + ?) / (COALESCE(units_received, 0) + ?)
+                  ELSE avg_unit_cost
+                END,
+              updated_utc = ?
+            WHERE part_key = ?
+        """, [qty, added_spend, qty, added_spend, added_spend, qty, ts, part_key])
 
-        if exists:
-            db.execute(
-                """
-                UPDATE parts_received
-                SET
-                  units_received = COALESCE(units_received, 0) + ?,
-                  total_spend = COALESCE(total_spend, 0) + ?,
-                  avg_unit_cost =
-                    CASE
-                      WHEN (COALESCE(units_received, 0) + ?) > 0 AND (COALESCE(total_spend, 0) + ?) > 0
-                      THEN (COALESCE(total_spend, 0) + ?) / (COALESCE(units_received, 0) + ?)
-                      ELSE avg_unit_cost
-                    END,
-                  updated_utc = ?
-                WHERE part_key = ?
-                """,
-                [qty, added_spend_each, qty, added_spend_each, added_spend_each, qty, ts, part_key],
-            )
+        console.print("[green]Updated parts_received.[/green]")
+        pause()
+        return
 
-            db.execute(
-                """
-                INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [str(uuid4()), ts, "receive", part_key, qty, unit_cost_f or None, added_spend_each or None, project, note],
-            )
-            continue
+    console.print("\n[bold]New part_key[/bold] — enter basic metadata (you can refine later).")
+    vendor = Prompt.ask("vendor", default=part_key.split(":", 1)[0] if ":" in part_key else "")
+    sku = Prompt.ask("sku", default=part_key.split(":", 1)[1] if ":" in part_key else "")
+    description = Prompt.ask("description", default="")
+    label_short = Prompt.ask("label_short", default=description or part_key)
 
-        if use_browser:
-            console.print(f"[yellow]Skipping part_key not found in parts_received:[/yellow] {part_key}")
-            continue
+    label_line1 = Prompt.ask("label_line1 (optional)", default="")
+    label_line2 = Prompt.ask("label_line2 (optional)", default="")
+    purchase_url = Prompt.ask("purchase_url (optional)", default="")
+    airtable_url = Prompt.ask("airtable_url (optional)", default="")
+    label_qr_url = Prompt.ask("label_qr_url (optional)", default="")
+    label_qr_text = Prompt.ask("label_qr_text (optional)", default="")
 
-        console.print("\n[bold]New part_key[/bold] — enter basic metadata (you can refine later).")
-        vendor = Prompt.ask("vendor", default=part_key.split(":", 1)[0] if ":" in part_key else "")
-        sku = Prompt.ask("sku", default=part_key.split(":", 1)[1] if ":" in part_key else "")
-        description = Prompt.ask("description", default="")
-        label_short = Prompt.ask("label_short", default=description or part_key)
+    desc_clean = description.strip()
+    avg_unit_cost = (added_spend / qty) if (qty > 0 and added_spend > 0) else 0.0
 
-        label_line1 = Prompt.ask("label_line1 (optional)", default="")
-        label_line2 = Prompt.ask("label_line2 (optional)", default="")
-        purchase_url = Prompt.ask("purchase_url (optional)", default="")
-        airtable_url = Prompt.ask("airtable_url (optional)", default="")
-        label_qr_url = Prompt.ask("label_qr_url (optional)", default="")
-        label_qr_text = Prompt.ask("label_qr_text (optional)", default="")
-
-        desc_clean = description.strip()
-        avg_unit_cost = (added_spend_each / qty) if (qty > 0 and added_spend_each > 0) else 0.0
-
-        db.execute(
-            """
-            INSERT INTO parts_received (
-                part_key, vendor, sku, description, desc_clean,
-                label_line1, label_line2, label_short,
-                purchase_url, airtable_url, label_qr_url, label_qr_text,
-                units_received, total_spend, last_invoice, avg_unit_cost, updated_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                part_key, vendor, sku, description, desc_clean,
-                label_line1, label_line2, label_short,
-                purchase_url, airtable_url, label_qr_url, label_qr_text,
-                qty, added_spend_each, None, avg_unit_cost, ts,
-            ],
+    db.execute("""
+        INSERT INTO parts_received (
+            part_key, vendor, sku, description, desc_clean,
+            label_line1, label_line2, label_short,
+            purchase_url, airtable_url, label_qr_url, label_qr_text,
+            units_received, total_spend, last_invoice, avg_unit_cost, updated_utc
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        part_key, vendor, sku, description, desc_clean,
+        label_line1, label_line2, label_short,
+        purchase_url, airtable_url, label_qr_url, label_qr_text,
+        qty, added_spend, None, avg_unit_cost, ts
+    ])
 
-        db.execute(
-            """
-            INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [str(uuid4()), ts, "receive", part_key, qty, unit_cost_f or None, added_spend_each or None, project, note],
-        )
-
-    console.print("[green]Receive complete.[/green]")
+    console.print("[green]Inserted new part into parts_received.[/green]")
     pause()
-
 
 
 def inv_edit_labels(db: DB):
@@ -1157,11 +1058,36 @@ def _fetch_label_rows(db: DB, part_keys: list[str]) -> list[dict]:
 
 
 def _default_layout_for_template(tpl_path: Path) -> dict:
+    """Default to a simple FLOW layout.
+
+    FLOW layout means:
+      - If QR is enabled, we split the label into QR + text area (horizontal or vertical).
+      - Text elements are stacked top-to-bottom in the text area.
+      - Element 'pos' / 'span' are ignored in FLOW mode.
+    """
     try:
         t = LabelTemplate.from_json(tpl_path)
         base_size = int(t.font_size)
     except Exception:
         base_size = 8
+
+    return {
+        "mode": "flow",
+        "elements": [
+            {"source": "label_line1", "style": "bold", "size": base_size, "align": "left", "wrap": False, "max_lines": 1},
+            {"source": "vendor_sku", "style": "normal", "size": base_size, "align": "left", "wrap": False, "max_lines": 1},
+        ],
+        # Horizontal QR left/right, or vertical QR top/bottom
+        "qr": {
+            "enabled": True,
+            "source": "purchase_url",
+            "orientation": "horizontal",
+            "side": "left",
+            "size_rel": 0.45,
+            "gap_rel": 0.08
+        },
+    }
+
 
     return {
         "elements": [
@@ -1217,7 +1143,6 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
         "Choose elements in order (comma list of # or names)",
         default=default_raw
     ).strip()
-
     if not raw:
         return
 
@@ -1242,29 +1167,21 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
     elems: list[dict] = []
 
     for idx, src in enumerate(chosen, 1):
-        # try to inherit defaults from existing element
         existing = by_source.get(src)
         if existing is None and idx - 1 < len(current):
             existing = current[idx - 1]
 
         d_style = str((existing or {}).get("style", "bold" if idx == 1 else "normal"))
         d_size = int((existing or {}).get("size", tpl_font_size))
-        d_pos = str((existing or {}).get("pos", "UL" if idx == 1 else "LL"))
         d_align = str((existing or {}).get("align", "left"))
         d_wrap = bool((existing or {}).get("wrap", False))
         d_lines = int((existing or {}).get("max_lines", 2 if d_wrap else 1))
         d_lines = max(1, d_lines)
 
-        d_span = int((existing or {}).get("span", 1))
-        d_span = max(1, min(3, d_span))
-
         console.print(f"\n[bold]Element {idx}[/bold] source=[cyan]{src}[/cyan]")
         style = Prompt.ask("Style", choices=STYLES, default=d_style)
         size = IntPrompt.ask("Font size", default=d_size)
-        pos = Prompt.ask("Position", choices=ANCHORS, default=d_pos)
         align = Prompt.ask("Justification", choices=ALIGNS, default=d_align)
-        span = IntPrompt.ask("Span columns (1–3)", default=d_span)
-        span = max(1, min(3, int(span)))
         wrap = Confirm.ask("Wrap text?", default=d_wrap)
         max_lines = IntPrompt.ask("Max lines", default=(d_lines if wrap else 1))
         max_lines = max(1, int(max_lines))
@@ -1273,211 +1190,12 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
             "source": src,
             "style": style,
             "size": int(size),
-            "pos": pos,
             "align": align,
-            "span": int(span),
             "wrap": bool(wrap),
             "max_lines": int(max_lines),
         })
 
     layout["elements"] = elems
-
-def _edit_qr(layout: dict) -> None:
-    qr_cfg = dict(layout.get("qr", {}) or {})
-    enabled = Confirm.ask("QR enabled?", default=bool(qr_cfg.get("enabled", True)))
-    qr_cfg["enabled"] = enabled
-    if enabled:
-        # pick source
-        t = Table(show_header=True, header_style="bold magenta")
-        t.add_column("#", justify="right", width=3)
-        t.add_column("source")
-        for i, (k, _) in enumerate(LABEL_SOURCES, 1):
-            t.add_row(str(i), k)
-        console.print("\n[bold]QR source[/bold]")
-        console.print(t)
-        src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
-        pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
-        size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
-        size_rel = max(0.2, min(0.9, float(size_rel)))
-        qr_cfg.update({"source": src, "pos": pos, "size_rel": size_rel})
-    layout["qr"] = qr_cfg
-
-
-def _layout_summary(layout: dict) -> None:
-    elems = layout.get("elements", []) or []
-    qr_cfg = layout.get("qr", {}) or {}
-    console.print("\n[bold]Current layout[/bold]")
-    t = Table(show_header=True, header_style="bold magenta")
-    t.add_column("#", justify="right", width=3)
-    t.add_column("source")
-    t.add_column("style")
-    t.add_column("size", justify="right")
-    t.add_column("pos")
-    t.add_column("span", justify="right")
-    t.add_column("align")
-    t.add_column("wrap")
-    t.add_column("lines", justify="right")
-    for i, e in enumerate(elems, 1):
-        t.add_row(
-            str(i),
-            str(e.get("source","")),
-            str(e.get("style","normal")),
-            str(e.get("size","")),
-            str(e.get("pos","UL")),
-            str(e.get("span", 1)),
-            str(e.get("align","left")),
-            "yes" if e.get("wrap") else "no",
-            str(e.get("max_lines", 1)),
-        )
-    console.print(t)
-    console.print(f"[dim]QR: enabled={qr_cfg.get('enabled', False)} source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} size_rel={qr_cfg.get('size_rel','')}[/dim]")
-
-
-def labels_generate(db: DB):
-    console.clear()
-    header()
-    console.print("[bold]Labels → Generate PDF[/bold]\n")
-
-    tpl_path = pick_label_template()
-    if not tpl_path:
-        return
-
-    # select items
-    console.print("[bold]Select items from inventory[/bold]")
-    console.print("[dim]Use sort keys (v/h/c/o), filter (f), then select: sel 87:200,205,206[/dim]\n")
-    sel = inv_browse(db, title="Inventory (select rows for labels)", allow_select=True)
-    if not sel:
-        return
-
-    part_keys = _fetch_selected_part_keys(db, sel)
-    if not part_keys:
-        console.print("[yellow]No valid rows selected.[/yellow]")
-        pause()
-        return
-
-    rows = _fetch_label_rows(db, part_keys)
-    if not rows:
-        console.print("[yellow]No label data found for selected items.[/yellow]")
-        pause()
-        return
-
-    # layout preset
-    layout, loaded_name = _pick_or_create_layout(tpl_path)
-
-    # template font size for defaults
-    try:
-        tpl_obj = LabelTemplate.from_json(tpl_path)
-        tpl_font_size = int(tpl_obj.font_size)
-        per_sheet = int(tpl_obj.cols * tpl_obj.rows)
-    except Exception:
-        tpl_font_size = 8
-        per_sheet = 1
-
-    used = 0
-
-    while True:
-        console.clear()
-        header()
-        console.print("[bold]Labels → Layout & Preview[/bold]")
-        console.print(f"[dim]Template:[/dim] {tpl_path.name}  |  [dim]Selected:[/dim] {len(rows)}  |  [dim]Used labels on sheet:[/dim] {used} / {per_sheet}")
-        if loaded_name:
-            console.print(f"[dim]Preset:[/dim] {loaded_name}")
-        _layout_summary(layout)
-
-        menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Edit elements")
-        menu.add_row("2.", "Edit QR")
-        menu.add_row("3.", "Set used labels on sheet")
-        menu.add_row("4.", "Preview (opens PDF)")
-        menu.add_row("5.", "Save preset")
-        menu.add_row("6.", "Export final PDF")
-        menu.add_row("0.", "Back")
-        console.print("\n", menu)
-
-        choice = Prompt.ask("Choose", choices=["1","2","3","4","5","6","0"], default="4")
-        if choice == "0":
-            return
-        elif choice == "1":
-            _edit_elements(layout, tpl_font_size)
-        elif choice == "2":
-            _edit_qr(layout)
-        elif choice == "3":
-            used = IntPrompt.ask(f"How many labels are already used on this sheet? (0–{max(0, per_sheet-1)})", default=used)
-            used = max(0, min(max(0, per_sheet-1), int(used)))
-        elif choice == "5":
-            name = Prompt.ask("Preset name", default=(loaded_name or "my_layout")).strip()
-            try:
-                p = save_label_preset(project_root(), tpl_path, name, layout)
-                loaded_name = p.stem
-                console.print(f"[green]Saved preset:[/green] {p}")
-            except Exception as e:
-                console.print(f"[red]Failed to save preset:[/red] {e}")
-            pause()
-        elif choice == "4":
-            preview_path = exports_dir() / "_labels_preview.pdf"
-            make_labels_pdf(
-                template_path=tpl_path,
-                out_pdf=preview_path,
-                rows=rows,
-                start_pos=used + 1,
-                include_qr=False,
-                layout=layout,
-                draw_boxes=False,
-            )
-            _open_pdf(preview_path)
-            pause()
-        elif choice == "6":
-            default_name = f"labels_{timestamp_slug()}.pdf"
-            name = Prompt.ask("Export filename", default=default_name).strip()
-            if not name.lower().endswith(".pdf"):
-                name += ".pdf"
-            out_pdf = exports_dir() / name
-            make_labels_pdf(
-                template_path=tpl_path,
-                out_pdf=out_pdf,
-                rows=rows,
-                start_pos=used + 1,
-                include_qr=False,
-                layout=layout,
-                draw_boxes=False,
-            )
-            _open_pdf(out_pdf)
-            console.print(f"[green]Exported:[/green] {out_pdf}")
-            pause()
-
-
-def menu_labels():
-    db = get_db()
-    while True:
-        console.clear()
-        header()
-        console.print("[bold]Labels[/bold]\n")
-
-        menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Generate labels PDF (with preview)")
-        menu.add_row("0.", "Back")
-        console.print(menu)
-
-        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="1")
-        if choice == "0":
-            return
-        if choice == "1":
-            labels_generate(db)
-
-
-
-# ----------------------------
-# Placeholder subcommands
-# ----------------------------
-@app.command()
-def ingest():
-    console.print("Use the menu for now. (Subcommands coming soon.)")
-
-
-@app.command()
-def export():
-    console.print("Use the menu for now. (Subcommands coming soon.)")
-
-
-if __name__ == "__main__":
-    app()
+    # ensure flow mode
+    layout["mode"] = "flow"
+    return

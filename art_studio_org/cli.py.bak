@@ -1058,11 +1058,36 @@ def _fetch_label_rows(db: DB, part_keys: list[str]) -> list[dict]:
 
 
 def _default_layout_for_template(tpl_path: Path) -> dict:
+    """Default to a simple FLOW layout.
+
+    FLOW layout means:
+      - If QR is enabled, we split the label into QR + text area (horizontal or vertical).
+      - Text elements are stacked top-to-bottom in the text area.
+      - Element 'pos' / 'span' are ignored in FLOW mode.
+    """
     try:
         t = LabelTemplate.from_json(tpl_path)
         base_size = int(t.font_size)
     except Exception:
         base_size = 8
+
+    return {
+        "mode": "flow",
+        "elements": [
+            {"source": "label_line1", "style": "bold", "size": base_size, "align": "left", "wrap": False, "max_lines": 1},
+            {"source": "vendor_sku", "style": "normal", "size": base_size, "align": "left", "wrap": False, "max_lines": 1},
+        ],
+        # Horizontal QR left/right, or vertical QR top/bottom
+        "qr": {
+            "enabled": True,
+            "source": "purchase_url",
+            "orientation": "horizontal",
+            "side": "left",
+            "size_rel": 0.45,
+            "gap_rel": 0.08
+        },
+    }
+
 
     return {
         "elements": [
@@ -1108,6 +1133,72 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
     for i, (k, label) in enumerate(LABEL_SOURCES, 1):
         t.add_row(str(i), k, label)
     console.print(t)
+
+    current = layout.get("elements", []) or []
+    default_raw = ",".join([str(e.get("source","")).strip() for e in current if str(e.get("source","")).strip()])
+    if not default_raw:
+        default_raw = "label_line1,vendor_sku"
+
+    raw = Prompt.ask(
+        "Choose elements in order (comma list of # or names)",
+        default=default_raw
+    ).strip()
+    if not raw:
+        return
+
+    # parse selection
+    chosen: list[str] = []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for p in parts:
+        if p.isdigit():
+            i = int(p)
+            if 1 <= i <= len(LABEL_SOURCES):
+                chosen.append(LABEL_SOURCES[i - 1][0])
+        else:
+            chosen.append(p)
+
+    # defaults from existing layout (by source)
+    by_source: dict[str, dict] = {}
+    for e in current:
+        s = str(e.get("source","")).strip()
+        if s and s not in by_source:
+            by_source[s] = e
+
+    elems: list[dict] = []
+
+    for idx, src in enumerate(chosen, 1):
+        existing = by_source.get(src)
+        if existing is None and idx - 1 < len(current):
+            existing = current[idx - 1]
+
+        d_style = str((existing or {}).get("style", "bold" if idx == 1 else "normal"))
+        d_size = int((existing or {}).get("size", tpl_font_size))
+        d_align = str((existing or {}).get("align", "left"))
+        d_wrap = bool((existing or {}).get("wrap", False))
+        d_lines = int((existing or {}).get("max_lines", 2 if d_wrap else 1))
+        d_lines = max(1, d_lines)
+
+        console.print(f"\n[bold]Element {idx}[/bold] source=[cyan]{src}[/cyan]")
+        style = Prompt.ask("Style", choices=STYLES, default=d_style)
+        size = IntPrompt.ask("Font size", default=d_size)
+        align = Prompt.ask("Justification", choices=ALIGNS, default=d_align)
+        wrap = Confirm.ask("Wrap text?", default=d_wrap)
+        max_lines = IntPrompt.ask("Max lines", default=(d_lines if wrap else 1))
+        max_lines = max(1, int(max_lines))
+
+        elems.append({
+            "source": src,
+            "style": style,
+            "size": int(size),
+            "align": align,
+            "wrap": bool(wrap),
+            "max_lines": int(max_lines),
+        })
+
+    layout["elements"] = elems
+    # ensure flow mode
+    layout["mode"] = "flow"
+
 
     current = layout.get("elements", []) or []
     default_raw = ",".join([str(e.get("source","")).strip() for e in current if str(e.get("source","")).strip()])
@@ -1196,25 +1287,43 @@ def _edit_qr(layout: dict) -> None:
             t.add_row(str(i), k)
         console.print("\n[bold]QR source[/bold]")
         console.print(t)
+
         src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
-        pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
+
+        orientation = Prompt.ask(
+            "Layout orientation (QR + text)",
+            choices=["horizontal", "vertical"],
+            default=str(qr_cfg.get("orientation", "horizontal"))
+        ).strip().lower()
+
+        if orientation == "horizontal":
+            side = Prompt.ask("QR side", choices=["left", "right"], default=str(qr_cfg.get("side", "left"))).strip().lower()
+        else:
+            side = Prompt.ask("QR side", choices=["top", "bottom"], default=str(qr_cfg.get("side", "top"))).strip().lower()
+
         size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
         size_rel = max(0.2, min(0.9, float(size_rel)))
-        qr_cfg.update({"source": src, "pos": pos, "size_rel": size_rel})
+
+        gap_rel = FloatPrompt.ask("Gap between QR and text (0.0–0.3)", default=float(qr_cfg.get("gap_rel", 0.08)))
+        gap_rel = max(0.0, min(0.3, float(gap_rel)))
+
+        qr_cfg.update({"source": src, "orientation": orientation, "side": side, "size_rel": size_rel, "gap_rel": gap_rel})
+
     layout["qr"] = qr_cfg
+    layout["mode"] = "flow"
+
 
 
 def _layout_summary(layout: dict) -> None:
     elems = layout.get("elements", []) or []
     qr_cfg = layout.get("qr", {}) or {}
+    mode = str(layout.get("mode", "flow")).lower()
     console.print("\n[bold]Current layout[/bold]")
     t = Table(show_header=True, header_style="bold magenta")
     t.add_column("#", justify="right", width=3)
     t.add_column("source")
     t.add_column("style")
     t.add_column("size", justify="right")
-    t.add_column("pos")
-    t.add_column("span", justify="right")
     t.add_column("align")
     t.add_column("wrap")
     t.add_column("lines", justify="right")
@@ -1224,14 +1333,22 @@ def _layout_summary(layout: dict) -> None:
             str(e.get("source","")),
             str(e.get("style","normal")),
             str(e.get("size","")),
-            str(e.get("pos","UL")),
-            str(e.get("span", 1)),
             str(e.get("align","left")),
             "yes" if e.get("wrap") else "no",
             str(e.get("max_lines", 1)),
         )
     console.print(t)
-    console.print(f"[dim]QR: enabled={qr_cfg.get('enabled', False)} source={qr_cfg.get('source','')} pos={qr_cfg.get('pos','')} size_rel={qr_cfg.get('size_rel','')}[/dim]")
+
+    qr_enabled = bool(qr_cfg.get("enabled", False))
+    if qr_enabled:
+        console.print(
+            f"[dim]Mode={mode} | QR: enabled=True source={qr_cfg.get('source','')} "
+            f"orientation={qr_cfg.get('orientation','horizontal')} side={qr_cfg.get('side','left')} "
+            f"size_rel={qr_cfg.get('size_rel','')} gap_rel={qr_cfg.get('gap_rel','')}[/dim]"
+        )
+    else:
+        console.print(f"[dim]Mode={mode} | QR: enabled=False[/dim]")
+
 
 
 def labels_generate(db: DB):

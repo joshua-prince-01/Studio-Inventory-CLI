@@ -206,58 +206,30 @@ def _wrap_lines(text: str, max_width: float, font: str, size: int, max_lines: in
     return lines[:max_lines]
 
 
-def _cell_box(pos: str, x: float, y: float, w: float, h: float, span_x: int = 1, span_y: int = 1) -> tuple[float, float, float, float, str]:
-    """
-    Divide the padded label content box (x,y,w,h) into a 3x3 grid.
-    pos like UL/UC/UR/ML/MC/MR/LL/LC/LR selects the anchor cell.
-
-    span_x spans columns (1–3), span_y spans rows (1–3). Spans are clamped to fit.
-
-    Anchoring rules:
-      - L anchors span to the right
-      - R anchors span to the left
-      - C anchors span centered as best as possible (for span=2 => cols 1–2)
-      - U anchors span downward
-      - L anchors span upward
-      - M anchors span centered as best as possible (for span=2 => rows 1–2)
-
-    Returns (cx, cy, cw, ch, row) where (cx,cy) is bottom-left of the spanned box.
-    """
+def _anchor_xy(pos: str, x: float, y: float, w: float, h: float) -> tuple[float, float, str]:
     pos = (pos or "UL").upper()
-    row = pos[0] if len(pos) >= 1 else "U"
-    col = pos[1] if len(pos) >= 2 else "L"
+    row = pos[0]
+    col = pos[1]
+    if row == "U":
+        y0 = y + h
+        v = "top"
+    elif row == "M":
+        y0 = y + h / 2
+        v = "mid"
+    else:
+        y0 = y
+        v = "bot"
 
-    cell_w = w / 3.0
-    cell_h = h / 3.0
-
-    span_x = max(1, min(3, int(span_x)))
-    span_y = max(1, min(3, int(span_y)))
-
-    # Column start index (0..2)
     if col == "L":
-        start_c = 0
-    elif col == "R":
-        start_c = 3 - span_x
-    else:  # C
-        start_c = 1 - ((span_x - 1) // 2)
-    start_c = max(0, min(3 - span_x, start_c))
-
-    # Row start index (0..2), where 0 is bottom, 2 is top
-    if row == "L":
-        start_r = 0
-    elif row == "U":
-        start_r = 3 - span_y
-    else:  # M
-        start_r = 1 - ((span_y - 1) // 2)
-    start_r = max(0, min(3 - span_y, start_r))
-
-    cx = x + start_c * cell_w
-    cy = y + start_r * cell_h
-    cw = cell_w * span_x
-    ch = cell_h * span_y
-
-    return cx, cy, cw, ch, row
-
+        x0 = x
+        hc = "left"
+    elif col == "C":
+        x0 = x + w / 2
+        hc = "center"
+    else:
+        x0 = x + w
+        hc = "right"
+    return x0, y0, f"{v}-{hc}"
 
 
 def _draw_aligned(c: canvas.Canvas, align: str, x: float, y: float, text: str) -> None:
@@ -270,10 +242,151 @@ def _draw_aligned(c: canvas.Canvas, align: str, x: float, y: float, text: str) -
         c.drawString(x, y, text)
 
 
-def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h: float, t: LabelTemplate, layout: dict) -> None:
+def _cell_rect(pos: str, x: float, y: float, w: float, h: float, span: int = 1) -> tuple[float, float, float, float, str]:
+    """Return a bounded rect for a 3x3 anchor cell (with optional horizontal span).
+
+    Returns: (cx, cy, cw, ch, row_tag) where row_tag in {"U","M","L"}.
+    """
+    pos = (pos or "UL").upper()
+    row = pos[0] if len(pos) >= 1 else "U"
+    col = pos[1] if len(pos) >= 2 else "L"
+
+    cell_w = w / 3.0
+    cell_h = h / 3.0
+
+    col_idx = {"L": 0, "C": 1, "R": 2}.get(col, 0)
+    row_idx = {"L": 0, "M": 1, "U": 2}.get(row, 2)  # bottom=0, top=2
+
+    span = max(1, min(3, int(span or 1)))
+    if span == 3:
+        start_col = 0
+    elif span == 2:
+        start_col = 1 if col_idx == 2 else 0
+    else:
+        start_col = col_idx
+
+    cx = x + start_col * cell_w
+    cy = y + row_idx * cell_h
+    cw = cell_w * span
+    ch = cell_h
+    return cx, cy, cw, ch, row
+
+
+def _flow_rects(x: float, y: float, w: float, h: float, qr_cfg: dict) -> tuple[tuple[float,float,float,float], Optional[tuple[float,float,float]]]:
+    """Compute (text_rect, qr_box) for FLOW mode.
+
+    text_rect: (tx, ty, tw, th)
+    qr_box: (qx, qy, qsize) or None
+    """
+    enabled = bool(qr_cfg.get("enabled", False))
+    if not enabled:
+        return (x, y, w, h), None
+
+    orientation = str(qr_cfg.get("orientation", "horizontal")).lower()
+    side = str(qr_cfg.get("side", "left")).lower()
+    size_rel = float(qr_cfg.get("size_rel", 0.45))
+    size_rel = max(0.2, min(0.9, size_rel))
+    gap_rel = float(qr_cfg.get("gap_rel", 0.08))
+    gap_rel = max(0.0, min(0.3, gap_rel))
+
+    gap = min(w, h) * gap_rel
+
+    if orientation == "vertical":
+        qr_size = min(w, h * size_rel)
+        qr_size = max(10, min(qr_size, min(w, h)))
+        # ensure text area remains usable
+        if h - qr_size - gap < 20:
+            qr_size = max(10, h - gap - 20)
+
+        qx = x + (w - qr_size) / 2
+        if side == "bottom":
+            qy = y
+            ty = y + qr_size + gap
+            th = h - qr_size - gap
+        else:  # top
+            qy = y + h - qr_size
+            ty = y
+            th = h - qr_size - gap
+        tx, tw = x, w
+        return (tx, ty, tw, th), (qx, qy, qr_size)
+
+    # horizontal
+    qr_size = min(h, w * size_rel)
+    qr_size = max(10, min(qr_size, min(w, h)))
+    if w - qr_size - gap < 20:
+        qr_size = max(10, w - gap - 20)
+
+    qy = y + (h - qr_size) / 2
+    if side == "right":
+        qx = x + w - qr_size
+        tx, tw = x, w - qr_size - gap
+    else:  # left
+        qx = x
+        tx, tw = x + qr_size + gap, w - qr_size - gap
+    ty, th = y, h
+    return (tx, ty, tw, th), (qx, qy, qr_size)
+
+
+def _render_flow_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h: float, t: LabelTemplate, layout: dict) -> None:
     elems = layout.get("elements", []) or []
     qr_cfg = layout.get("qr", {}) or {}
-    qr_enabled = bool(qr_cfg.get("enabled", False))
+    text_rect, qr_box = _flow_rects(x, y, w, h, qr_cfg)
+
+    tx, ty, tw, th = text_rect
+
+    # draw QR first
+    if qr_box and bool(qr_cfg.get("enabled", False)):
+        qr_source = qr_cfg.get("source", "purchase_url")
+        qr_text = _source_value(item, qr_source).strip()
+        if qr_text:
+            qx, qy, qs = qr_box
+            _draw_qr(c, qx, qy, qs, qr_text)
+
+    # text stack (top-down)
+    y_cursor = ty + th
+    for e in elems:
+        src = e.get("source", "")
+        text = _source_value(item, src).strip()
+        if not text:
+            continue
+
+        style = e.get("style", "normal")
+        size = int(e.get("size", t.font_size))
+        align = e.get("align", "left")
+        wrap = bool(e.get("wrap", False))
+        max_lines = int(e.get("max_lines", 1))
+
+        font = _font_for_style(t.font_name, style)
+        c.setFont(font, size)
+
+        lines = _wrap_lines(text, tw, font, size, max_lines) if wrap else [_truncate_to_width(text, tw, font, size)]
+        leading = max(1, int(size * 1.15))
+
+        # start at top line baseline
+        y_cursor -= size
+        for ln in lines:
+            if y_cursor < ty:
+                break
+            if align == "center":
+                c.drawCentredString(tx + tw / 2, y_cursor, ln)
+            elif align == "right":
+                c.drawRightString(tx + tw, y_cursor, ln)
+            else:
+                c.drawString(tx, y_cursor, ln)
+            y_cursor -= leading
+
+        # small gap between elements
+        y_cursor -= max(0, int(size * 0.1))
+
+        if y_cursor < ty:
+            break
+
+    c.setFont(t.font_name, t.font_size)
+
+
+def _render_grid_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h: float, t: LabelTemplate, layout: dict) -> None:
+    elems = layout.get("elements", []) or []
+    qr_cfg = layout.get("qr", {}) or {}
 
     for e in elems:
         source = e.get("source", "")
@@ -285,50 +398,130 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
         size = int(e.get("size", t.font_size))
         pos = e.get("pos", "UL")
         align = e.get("align", "left")
-        span = int(e.get("span", e.get("span_x", 1)) or 1)
-        span = max(1, min(3, span))
         wrap = bool(e.get("wrap", False))
         max_lines = int(e.get("max_lines", 1))
+        span = int(e.get("span", 1))
 
         font = _font_for_style(t.font_name, style)
         c.setFont(font, size)
 
+        cx, cy, cw, ch, row = _cell_rect(pos, x, y, w, h, span=span)
+        max_w = cw
+
+        lines = _wrap_lines(text, max_w, font, size, max_lines) if wrap else [_truncate_to_width(text, max_w, font, size)]
         leading = max(1, int(size * 1.15))
 
-        # Bound each element to a 3x3 cell inside the padded label area
-        cx, cy, cw, ch, row = _cell_box(pos, x, y, w, h, span_x=span)
-
-        # Cap lines by what fits vertically in the cell
-        max_lines_cell = max(1, int(ch // leading))
-        ml = max(1, min(max_lines, max_lines_cell))
-
-        max_w = cw
-        lines = _wrap_lines(text, max_w, font, size, ml) if wrap else [_truncate_to_width(text, max_w, font, size)]
-
-        align_l = (align or "left").lower()
-        if align_l == "center":
+        if align == "center":
             ax = cx + cw / 2
-        elif align_l == "right":
+        elif align == "right":
             ax = cx + cw
         else:
             ax = cx
 
         if row == "U":
-            cur_y = (cy + ch) - size
+            cur_y = cy + ch - size
             for ln in lines:
                 _draw_aligned(c, align, ax, cur_y, ln)
                 cur_y -= leading
-
         elif row == "M":
             total_h = len(lines) * leading
             cur_y = (cy + ch / 2) + (total_h / 2) - size
             for ln in lines:
                 _draw_aligned(c, align, ax, cur_y, ln)
                 cur_y -= leading
+        else:  # L
+            cur_y = cy + size + (len(lines) - 1) * leading
+            for ln in lines:
+                _draw_aligned(c, align, ax, cur_y, ln)
+                cur_y -= leading
+
+    # QR in grid mode (legacy: uses pos)
+    if bool(qr_cfg.get("enabled", False)):
+        qr_source = qr_cfg.get("source", "purchase_url")
+        qr_text = _source_value(item, qr_source).strip()
+        if qr_text:
+            size_rel = float(qr_cfg.get("size_rel", 0.45))
+            qr_size = max(10, min(w, h) * max(0.2, min(0.9, size_rel)))
+            pos = qr_cfg.get("pos", "UR")
+            qx, qy, qw, qh, _row = _cell_rect(pos, x, y, w, h, span=1)
+            # place within that cell, top-left of cell by default
+            # but keep consistent with old behavior: align to cell based on anchor
+            ax, ay, anchor = _anchor_xy(pos, qx, qy, qw, qh)
+            if anchor.startswith("top"):
+                qr_y = (qy + qh) - qr_size
+            elif anchor.startswith("mid"):
+                qr_y = (qy + qh/2) - qr_size/2
+            else:
+                qr_y = qy
+            if anchor.endswith("left"):
+                qr_x = qx
+            elif anchor.endswith("center"):
+                qr_x = (qx + qw/2) - qr_size/2
+            else:
+                qr_x = (qx + qw) - qr_size
+            _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
+
+    c.setFont(t.font_name, t.font_size)
+
+
+def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h: float, t: LabelTemplate, layout: dict) -> None:
+    """Render a label using either FLOW or GRID mode.
+
+    FLOW mode is the new default:
+      - QR + text are arranged horizontally or vertically.
+      - Text elements are stacked in the remaining text area.
+
+    GRID mode is kept for backward compatibility with older presets that use pos/span/qr.pos.
+    """
+    mode = str(layout.get("mode", "") or "").lower()
+    elems = layout.get("elements", []) or []
+    qr_cfg = layout.get("qr", {}) or {}
+
+    # Auto-detect FLOW if QR has orientation/side or if elements have no 'pos'
+    if mode == "flow" or ("orientation" in qr_cfg) or (elems and "pos" not in elems[0]):
+        _render_flow_layout(c, item, x, y, w, h, t, layout)
+    else:
+        _render_grid_layout(c, item, x, y, w, h, t, layout)
+
+
+    for e in elems:
+        source = e.get("source", "")
+        text = _source_value(item, source).strip()
+        if not text:
+            continue
+
+        style = e.get("style", "normal")
+        size = int(e.get("size", t.font_size))
+        pos = e.get("pos", "UL")
+        align = e.get("align", "left")
+        wrap = bool(e.get("wrap", False))
+        max_lines = int(e.get("max_lines", 1))
+
+        font = _font_for_style(t.font_name, style)
+        c.setFont(font, size)
+
+        max_w = w
+        lines = _wrap_lines(text, max_w, font, size, max_lines) if wrap else [_truncate_to_width(text, max_w, font, size)]
+
+        leading = max(1, int(size * 1.15))
+        ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
+
+        if anchor.startswith("top"):
+            cur_y = ay - size
+            for ln in lines:
+                _draw_aligned(c, align, ax, cur_y, ln)
+                cur_y -= leading
+
+        elif anchor.startswith("mid"):
+            total_h = len(lines) * leading
+            cur_y = ay + (total_h / 2) - size
+            for ln in lines:
+                _draw_aligned(c, align, ax, cur_y, ln)
+                cur_y -= leading
 
         else:
             for i, ln in enumerate(lines):
-                yy = (cy + size) + (len(lines) - 1 - i) * leading
+                yy = (y + size) + (len(lines) - 1 - i) * leading
                 _draw_aligned(c, align, ax, yy, ln)
 
     if qr_enabled:
@@ -338,17 +531,21 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
             size_rel = float(qr_cfg.get("size_rel", 0.45))
             qr_size = max(10, min(w, h) * max(0.2, min(0.9, size_rel)))
             pos = qr_cfg.get("pos", "UR")
-            cx, cy, cw, ch, _row = _cell_box(pos, x, y, w, h)
+            ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
 
-            base = min(cw, ch)
-            size_rel = float(qr_cfg.get("size_rel", 0.85))
-            size_rel = max(0.2, min(0.95, size_rel))
+            if anchor.startswith("top"):
+                qr_y = (y + h) - qr_size
+            elif anchor.startswith("mid"):
+                qr_y = (y + h/2) - qr_size/2
+            else:
+                qr_y = y
 
-            qr_size = base * size_rel
-            qr_size = max(10, min(qr_size, cw, ch))  # keep inside the cell
-
-            qr_x = cx + (cw - qr_size) / 2
-            qr_y = cy + (ch - qr_size) / 2
+            if anchor.endswith("left"):
+                qr_x = x
+            elif anchor.endswith("center"):
+                qr_x = (x + w/2) - qr_size/2
+            else:
+                qr_x = (x + w) - qr_size
 
             _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
 

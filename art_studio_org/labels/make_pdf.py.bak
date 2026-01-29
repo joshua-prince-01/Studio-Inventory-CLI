@@ -206,30 +206,58 @@ def _wrap_lines(text: str, max_width: float, font: str, size: int, max_lines: in
     return lines[:max_lines]
 
 
-def _anchor_xy(pos: str, x: float, y: float, w: float, h: float) -> tuple[float, float, str]:
-    pos = (pos or "UL").upper()
-    row = pos[0]
-    col = pos[1]
-    if row == "U":
-        y0 = y + h
-        v = "top"
-    elif row == "M":
-        y0 = y + h / 2
-        v = "mid"
-    else:
-        y0 = y
-        v = "bot"
+def _cell_box(pos: str, x: float, y: float, w: float, h: float, span_x: int = 1, span_y: int = 1) -> tuple[float, float, float, float, str]:
+    """
+    Divide the padded label content box (x,y,w,h) into a 3x3 grid.
+    pos like UL/UC/UR/ML/MC/MR/LL/LC/LR selects the anchor cell.
 
+    span_x spans columns (1–3), span_y spans rows (1–3). Spans are clamped to fit.
+
+    Anchoring rules:
+      - L anchors span to the right
+      - R anchors span to the left
+      - C anchors span centered as best as possible (for span=2 => cols 1–2)
+      - U anchors span downward
+      - L anchors span upward
+      - M anchors span centered as best as possible (for span=2 => rows 1–2)
+
+    Returns (cx, cy, cw, ch, row) where (cx,cy) is bottom-left of the spanned box.
+    """
+    pos = (pos or "UL").upper()
+    row = pos[0] if len(pos) >= 1 else "U"
+    col = pos[1] if len(pos) >= 2 else "L"
+
+    cell_w = w / 3.0
+    cell_h = h / 3.0
+
+    span_x = max(1, min(3, int(span_x)))
+    span_y = max(1, min(3, int(span_y)))
+
+    # Column start index (0..2)
     if col == "L":
-        x0 = x
-        hc = "left"
-    elif col == "C":
-        x0 = x + w / 2
-        hc = "center"
-    else:
-        x0 = x + w
-        hc = "right"
-    return x0, y0, f"{v}-{hc}"
+        start_c = 0
+    elif col == "R":
+        start_c = 3 - span_x
+    else:  # C
+        start_c = 1 - ((span_x - 1) // 2)
+    start_c = max(0, min(3 - span_x, start_c))
+
+    # Row start index (0..2), where 0 is bottom, 2 is top
+    if row == "L":
+        start_r = 0
+    elif row == "U":
+        start_r = 3 - span_y
+    else:  # M
+        start_r = 1 - ((span_y - 1) // 2)
+    start_r = max(0, min(3 - span_y, start_r))
+
+    cx = x + start_c * cell_w
+    cy = y + start_r * cell_h
+    cw = cell_w * span_x
+    ch = cell_h * span_y
+
+    return cx, cy, cw, ch, row
+
 
 
 def _draw_aligned(c: canvas.Canvas, align: str, x: float, y: float, text: str) -> None:
@@ -257,34 +285,50 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
         size = int(e.get("size", t.font_size))
         pos = e.get("pos", "UL")
         align = e.get("align", "left")
+        span = int(e.get("span", e.get("span_x", 1)) or 1)
+        span = max(1, min(3, span))
         wrap = bool(e.get("wrap", False))
         max_lines = int(e.get("max_lines", 1))
 
         font = _font_for_style(t.font_name, style)
         c.setFont(font, size)
 
-        max_w = w
-        lines = _wrap_lines(text, max_w, font, size, max_lines) if wrap else [_truncate_to_width(text, max_w, font, size)]
-
         leading = max(1, int(size * 1.15))
-        ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
 
-        if anchor.startswith("top"):
-            cur_y = ay - size
+        # Bound each element to a 3x3 cell inside the padded label area
+        cx, cy, cw, ch, row = _cell_box(pos, x, y, w, h, span_x=span)
+
+        # Cap lines by what fits vertically in the cell
+        max_lines_cell = max(1, int(ch // leading))
+        ml = max(1, min(max_lines, max_lines_cell))
+
+        max_w = cw
+        lines = _wrap_lines(text, max_w, font, size, ml) if wrap else [_truncate_to_width(text, max_w, font, size)]
+
+        align_l = (align or "left").lower()
+        if align_l == "center":
+            ax = cx + cw / 2
+        elif align_l == "right":
+            ax = cx + cw
+        else:
+            ax = cx
+
+        if row == "U":
+            cur_y = (cy + ch) - size
             for ln in lines:
                 _draw_aligned(c, align, ax, cur_y, ln)
                 cur_y -= leading
 
-        elif anchor.startswith("mid"):
+        elif row == "M":
             total_h = len(lines) * leading
-            cur_y = ay + (total_h / 2) - size
+            cur_y = (cy + ch / 2) + (total_h / 2) - size
             for ln in lines:
                 _draw_aligned(c, align, ax, cur_y, ln)
                 cur_y -= leading
 
         else:
             for i, ln in enumerate(lines):
-                yy = (y + size) + (len(lines) - 1 - i) * leading
+                yy = (cy + size) + (len(lines) - 1 - i) * leading
                 _draw_aligned(c, align, ax, yy, ln)
 
     if qr_enabled:
@@ -294,21 +338,17 @@ def _render_layout(c: canvas.Canvas, item: dict, x: float, y: float, w: float, h
             size_rel = float(qr_cfg.get("size_rel", 0.45))
             qr_size = max(10, min(w, h) * max(0.2, min(0.9, size_rel)))
             pos = qr_cfg.get("pos", "UR")
-            ax, ay, anchor = _anchor_xy(pos, x, y, w, h)
+            cx, cy, cw, ch, _row = _cell_box(pos, x, y, w, h)
 
-            if anchor.startswith("top"):
-                qr_y = (y + h) - qr_size
-            elif anchor.startswith("mid"):
-                qr_y = (y + h/2) - qr_size/2
-            else:
-                qr_y = y
+            base = min(cw, ch)
+            size_rel = float(qr_cfg.get("size_rel", 0.85))
+            size_rel = max(0.2, min(0.95, size_rel))
 
-            if anchor.endswith("left"):
-                qr_x = x
-            elif anchor.endswith("center"):
-                qr_x = (x + w/2) - qr_size/2
-            else:
-                qr_x = (x + w) - qr_size
+            qr_size = base * size_rel
+            qr_size = max(10, min(qr_size, cw, ch))  # keep inside the cell
+
+            qr_x = cx + (cw - qr_size) / 2
+            qr_y = cy + (ch - qr_size) / 2
 
             _draw_qr(c, qr_x, qr_y, qr_size, qr_text)
 
