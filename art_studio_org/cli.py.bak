@@ -1156,11 +1156,16 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
         d_lines = int((existing or {}).get("max_lines", 2 if d_wrap else 1))
         d_lines = max(1, d_lines)
 
+        d_span = int((existing or {}).get("span", 1))
+        d_span = max(1, min(3, d_span))
+
         console.print(f"\n[bold]Element {idx}[/bold] source=[cyan]{src}[/cyan]")
         style = Prompt.ask("Style", choices=STYLES, default=d_style)
         size = IntPrompt.ask("Font size", default=d_size)
         pos = Prompt.ask("Position", choices=ANCHORS, default=d_pos)
         align = Prompt.ask("Justification", choices=ALIGNS, default=d_align)
+        span = IntPrompt.ask("Span columns (1–3)", default=d_span)
+        span = max(1, min(3, int(span)))
         wrap = Confirm.ask("Wrap text?", default=d_wrap)
         max_lines = IntPrompt.ask("Max lines", default=(d_lines if wrap else 1))
         max_lines = max(1, int(max_lines))
@@ -1171,6 +1176,7 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
             "size": int(size),
             "pos": pos,
             "align": align,
+            "span": int(span),
             "wrap": bool(wrap),
             "max_lines": int(max_lines),
         })
@@ -1208,6 +1214,7 @@ def _layout_summary(layout: dict) -> None:
     t.add_column("style")
     t.add_column("size", justify="right")
     t.add_column("pos")
+    t.add_column("span", justify="right")
     t.add_column("align")
     t.add_column("wrap")
     t.add_column("lines", justify="right")
@@ -1218,6 +1225,7 @@ def _layout_summary(layout: dict) -> None:
             str(e.get("style","normal")),
             str(e.get("size","")),
             str(e.get("pos","UL")),
+            str(e.get("span", 1)),
             str(e.get("align","left")),
             "yes" if e.get("wrap") else "no",
             str(e.get("max_lines", 1)),
