@@ -1049,6 +1049,34 @@ ALIGNS = ["left","center","right"]
 STYLES = ["normal","bold","italic"]
 
 
+def _normalize_label_source_token(token: object) -> str:
+    """Allow presets/inputs to refer to LABEL_SOURCES by 1-based index (e.g. '7')."""
+    t = str(token).strip()
+    if t.isdigit():
+        i = int(t)
+        if 1 <= i <= len(LABEL_SOURCES):
+            return LABEL_SOURCES[i - 1][0]
+    return t
+
+
+def _normalize_layout_sources(layout: dict) -> dict:
+    """Mutates layout in-place to normalize any numeric 'source' fields to real keys."""
+    if not isinstance(layout, dict):
+        return layout
+    # elements
+    elems = layout.get("elements", []) or []
+    for e in elems:
+        if isinstance(e, dict) and "source" in e:
+            e["source"] = _normalize_label_source_token(e.get("source", ""))
+    # qr
+    qr_cfg = layout.get("qr", {}) or {}
+    if isinstance(qr_cfg, dict) and "source" in qr_cfg:
+        qr_cfg["source"] = _normalize_label_source_token(qr_cfg.get("source", ""))
+    layout["qr"] = qr_cfg
+    layout["elements"] = elems
+    return layout
+
+
 def _open_pdf(path: Path) -> None:
     try:
         if sys.platform.startswith("darwin"):
@@ -1185,17 +1213,17 @@ def _pick_or_create_layout(tpl_path: Path) -> tuple[dict, str | None]:
         console.print("[dim]0 = start from default layout[/dim]")
         idx = IntPrompt.ask("Preset #", default=0)
         if idx == 0:
-            return _default_layout_for_template(tpl_path), None
+            return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
         if 1 <= idx <= len(presets):
             p = presets[idx - 1]
             try:
-                return load_label_preset(p), p.stem
+                return _normalize_layout_sources(load_label_preset(p)), p.stem
             except Exception:
-                return _default_layout_for_template(tpl_path), None
-        return _default_layout_for_template(tpl_path), None
+                return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
+        return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
     else:
         console.print("[dim]No presets yet. Starting from default.[/dim]")
-        return _default_layout_for_template(tpl_path), None
+        return _normalize_layout_sources(_default_layout_for_template(tpl_path)), None
 
 
 def _edit_elements(layout: dict, tpl_font_size: int) -> None:
@@ -1284,6 +1312,9 @@ def _edit_elements(layout: dict, tpl_font_size: int) -> None:
 
 def _edit_qr(layout: dict) -> None:
     qr_cfg = dict(layout.get("qr", {}) or {})
+    # Back-compat: some presets stored numeric sources like "7"
+    if "source" in qr_cfg:
+        qr_cfg["source"] = _normalize_label_source_token(qr_cfg.get("source", ""))
     enabled = Confirm.ask("QR enabled?", default=bool(qr_cfg.get("enabled", True)))
     qr_cfg["enabled"] = enabled
     if enabled:
@@ -1295,7 +1326,8 @@ def _edit_qr(layout: dict) -> None:
             t.add_row(str(i), k)
         console.print("\n[bold]QR source[/bold]")
         console.print(t)
-        src = Prompt.ask("QR source", default=str(qr_cfg.get("source", "purchase_url"))).strip() or "purchase_url"
+        src_in = Prompt.ask("QR source (# or name)", default=str(qr_cfg.get("source", "purchase_url"))).strip()
+        src = _normalize_label_source_token(src_in or qr_cfg.get("source", "purchase_url") or "purchase_url") or "purchase_url"
         pos = Prompt.ask("QR position", choices=ANCHORS, default=str(qr_cfg.get("pos", "UR")))
         size_rel = FloatPrompt.ask("QR size (0.2–0.9)", default=float(qr_cfg.get("size_rel", 0.45)))
         size_rel = max(0.2, min(0.9, float(size_rel)))

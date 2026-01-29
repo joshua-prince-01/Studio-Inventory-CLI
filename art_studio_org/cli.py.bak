@@ -35,6 +35,25 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def ensure_inventory_events_table(db: DB) -> None:
+    # Unified audit log for manual receive/remove actions
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_events (
+            event_uid   TEXT PRIMARY KEY,
+            ts_utc      TEXT NOT NULL,
+            event_type  TEXT NOT NULL,   -- 'receive' or 'remove'
+            part_key    TEXT NOT NULL,
+            qty         REAL NOT NULL,
+            unit_cost   REAL,
+            total_cost  REAL,
+            project     TEXT,
+            note        TEXT
+        )
+        """
+    )
+
+
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
@@ -661,10 +680,8 @@ def inv_show(db: DB, part_key: str | None = None):
     header()
     console.print("[bold]Show inventory item[/bold]\n")
 
-    if part_key is None:
-        part_key = Prompt.ask("part_key").strip()
-
-    part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)").strip()
+    if not part_key:
+        part_key = Prompt.ask("part_key (e.g. mcmaster:1234K56)", default="").strip()
     if not part_key:
         return
 
@@ -680,29 +697,50 @@ def inv_show(db: DB, part_key: str | None = None):
         t.add_row(f"[dim]{k}[/dim]", safe_str(r[k]))
     console.print(t)
 
-    console.print("\n[bold]Recent removals[/bold]")
-    rem = db.rows("""
-        SELECT ts_utc, qty_removed, project, note
-        FROM parts_removed
-        WHERE part_key = ?
-        ORDER BY ts_utc DESC
-        LIMIT 10
-    """, [part_key])
+    # Recent audit notes (if available)
+    try:
+        ev = db.rows(
+            "SELECT ts_utc, event_type, qty, unit_cost, project, note "
+            "FROM inventory_events WHERE part_key = ? ORDER BY ts_utc DESC LIMIT 10",
+            [part_key],
+        )
+        if ev:
+            console.print("\n[bold]Recent events[/bold]")
+            et = Table(show_header=True, header_style="bold cyan")
+            et.add_column("ts_utc", width=20)
+            et.add_column("type", width=8)
+            et.add_column("qty", justify="right", width=8)
+            et.add_column("unit_cost", justify="right", width=10)
+            et.add_column("project", width=16)
+            et.add_column("note")
+            for e in ev:
+                et.add_row(
+                    safe_str(e["ts_utc"]),
+                    safe_str(e["event_type"]),
+                    safe_str(e["qty"]),
+                    fmt_money(e["unit_cost"]),
+                    shorten(safe_str(e["project"]), 16),
+                    shorten(safe_str(e["note"]), 60),
+                )
+            console.print(et)
+    except Exception:
+        pass
 
-    if not rem:
-        console.print("[dim](none)[/dim]")
-    else:
-        rt = Table(show_header=True, header_style="bold cyan")
-        rt.add_column("ts_utc", style="dim")
-        rt.add_column("qty_removed", justify="right", width=10)
-        rt.add_column("project", width=18)
-        rt.add_column("note")
-        for rr in rem:
-            rt.add_row(safe_str(rr["ts_utc"]), safe_str(rr["qty_removed"]), shorten(rr["project"], 18), shorten(rr["note"], 60))
-        console.print(rt)
+    pause()
 
-    Prompt.ask("\nPress Enter to go back", default="")
-    return
+
+def pick_part_keys_from_browser(db: DB, title: str) -> list[str]:
+    console.clear()
+    header()
+    console.print(f"[bold]{title}[/bold]\n")
+    console.print("[dim]Use sort keys (v/h/c/o), filter (f), type a row # for details, then select: sel 205 or sel 87:200,205[/dim]\n")
+    sel = inv_browse(db, title=title, allow_select=True)
+    if not sel:
+        return []
+    return _fetch_selected_part_keys(db, sel)
+
+
+
 
 
 def inv_remove(db: DB):
@@ -710,35 +748,60 @@ def inv_remove(db: DB):
     header()
     console.print("[bold]Remove stock[/bold] (logs to parts_removed)\n")
 
-    part_key = Prompt.ask("part_key").strip()
-    if not part_key:
-        return
+    use_browser = Confirm.ask("Pick part(s) from inventory browser?", default=True)
+    if use_browser:
+        part_keys = pick_part_keys_from_browser(db, "Remove parts")
+        if not part_keys:
+            return
+    else:
+        pk = Prompt.ask("part_key").strip()
+        if not pk:
+            return
+        part_keys = [pk]
 
-    exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
-    if not exists:
-        console.print("[red]part_key not found in parts_received.[/red]")
-        pause()
-        return
-
-    qty = FloatPrompt.ask("Qty removed", default=1.0)
+    qty = FloatPrompt.ask("Qty removed (applies to each selected item)", default=1.0)
     if qty <= 0:
         console.print("[yellow]Qty must be > 0[/yellow]")
         pause()
         return
 
     project = Prompt.ask("Project (optional)", default="").strip()
-    note = Prompt.ask("Note (optional)", default="").strip()
+    note = Prompt.ask("Note (why?) (optional)", default="").strip()
 
     ts = utc_now_iso()
-    removal_uid = str(uuid4())
+    ensure_inventory_events_table(db)
 
-    db.execute("""
-        INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, [removal_uid, part_key, qty, ts, project, note, ts])
+    skipped = 0
+    for part_key in part_keys:
+        exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
+        if not exists:
+            skipped += 1
+            continue
+
+        removal_uid = str(uuid4())
+        db.execute(
+            """
+            INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [removal_uid, part_key, qty, ts, project, note, ts],
+        )
+
+        # Unified event log (qty negative for remove)
+        db.execute(
+            """
+            INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [str(uuid4()), ts, "remove", part_key, -qty, None, None, project, note],
+        )
+
+    if skipped:
+        console.print(f"[yellow]Skipped {skipped} item(s) not found in parts_received.[/yellow]")
 
     console.print("[green]Logged removal.[/green] inventory_view on_hand will update automatically.")
     pause()
+
 
 
 def inv_receive(db: DB):
@@ -746,11 +809,18 @@ def inv_receive(db: DB):
     header()
     console.print("[bold]Receive stock (manual)[/bold] (upserts parts_received)\n")
 
-    part_key = Prompt.ask("part_key (recommended format: vendor:sku)").strip()
-    if not part_key:
-        return
+    use_browser = Confirm.ask("Pick existing part(s) from inventory browser?", default=True)
+    if use_browser:
+        part_keys = pick_part_keys_from_browser(db, "Receive parts")
+        if not part_keys:
+            return
+    else:
+        pk = Prompt.ask("part_key (recommended format: vendor:sku)").strip()
+        if not pk:
+            return
+        part_keys = [pk]
 
-    qty = FloatPrompt.ask("Qty received", default=1.0)
+    qty = FloatPrompt.ask("Qty received (applies to each selected item)", default=1.0)
     if qty <= 0:
         console.print("[yellow]Qty must be > 0[/yellow]")
         pause()
@@ -762,64 +832,93 @@ def inv_receive(db: DB):
     except ValueError:
         unit_cost_f = 0.0
 
-    added_spend = qty * unit_cost_f
+    project = Prompt.ask("Project (optional)", default="").strip()
+    note = Prompt.ask("Note (why?) (optional)", default="").strip()
 
-    exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
+    added_spend_each = qty * unit_cost_f
     ts = utc_now_iso()
+    ensure_inventory_events_table(db)
 
-    if exists:
-        db.execute("""
-            UPDATE parts_received
-            SET
-              units_received = COALESCE(units_received, 0) + ?,
-              total_spend = COALESCE(total_spend, 0) + ?,
-              avg_unit_cost =
-                CASE
-                  WHEN (COALESCE(units_received, 0) + ?) > 0 AND (COALESCE(total_spend, 0) + ?) > 0
-                  THEN (COALESCE(total_spend, 0) + ?) / (COALESCE(units_received, 0) + ?)
-                  ELSE avg_unit_cost
-                END,
-              updated_utc = ?
-            WHERE part_key = ?
-        """, [qty, added_spend, qty, added_spend, added_spend, qty, ts, part_key])
+    for part_key in part_keys:
+        exists = db.scalar("SELECT 1 FROM parts_received WHERE part_key = ? LIMIT 1", [part_key])
 
-        console.print("[green]Updated parts_received.[/green]")
-        pause()
-        return
+        if exists:
+            db.execute(
+                """
+                UPDATE parts_received
+                SET
+                  units_received = COALESCE(units_received, 0) + ?,
+                  total_spend = COALESCE(total_spend, 0) + ?,
+                  avg_unit_cost =
+                    CASE
+                      WHEN (COALESCE(units_received, 0) + ?) > 0 AND (COALESCE(total_spend, 0) + ?) > 0
+                      THEN (COALESCE(total_spend, 0) + ?) / (COALESCE(units_received, 0) + ?)
+                      ELSE avg_unit_cost
+                    END,
+                  updated_utc = ?
+                WHERE part_key = ?
+                """,
+                [qty, added_spend_each, qty, added_spend_each, added_spend_each, qty, ts, part_key],
+            )
 
-    console.print("\n[bold]New part_key[/bold] — enter basic metadata (you can refine later).")
-    vendor = Prompt.ask("vendor", default=part_key.split(":", 1)[0] if ":" in part_key else "")
-    sku = Prompt.ask("sku", default=part_key.split(":", 1)[1] if ":" in part_key else "")
-    description = Prompt.ask("description", default="")
-    label_short = Prompt.ask("label_short", default=description or part_key)
+            db.execute(
+                """
+                INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [str(uuid4()), ts, "receive", part_key, qty, unit_cost_f or None, added_spend_each or None, project, note],
+            )
+            continue
 
-    label_line1 = Prompt.ask("label_line1 (optional)", default="")
-    label_line2 = Prompt.ask("label_line2 (optional)", default="")
-    purchase_url = Prompt.ask("purchase_url (optional)", default="")
-    airtable_url = Prompt.ask("airtable_url (optional)", default="")
-    label_qr_url = Prompt.ask("label_qr_url (optional)", default="")
-    label_qr_text = Prompt.ask("label_qr_text (optional)", default="")
+        if use_browser:
+            console.print(f"[yellow]Skipping part_key not found in parts_received:[/yellow] {part_key}")
+            continue
 
-    desc_clean = description.strip()
-    avg_unit_cost = (added_spend / qty) if (qty > 0 and added_spend > 0) else 0.0
+        console.print("\n[bold]New part_key[/bold] — enter basic metadata (you can refine later).")
+        vendor = Prompt.ask("vendor", default=part_key.split(":", 1)[0] if ":" in part_key else "")
+        sku = Prompt.ask("sku", default=part_key.split(":", 1)[1] if ":" in part_key else "")
+        description = Prompt.ask("description", default="")
+        label_short = Prompt.ask("label_short", default=description or part_key)
 
-    db.execute("""
-        INSERT INTO parts_received (
-            part_key, vendor, sku, description, desc_clean,
-            label_line1, label_line2, label_short,
-            purchase_url, airtable_url, label_qr_url, label_qr_text,
-            units_received, total_spend, last_invoice, avg_unit_cost, updated_utc
+        label_line1 = Prompt.ask("label_line1 (optional)", default="")
+        label_line2 = Prompt.ask("label_line2 (optional)", default="")
+        purchase_url = Prompt.ask("purchase_url (optional)", default="")
+        airtable_url = Prompt.ask("airtable_url (optional)", default="")
+        label_qr_url = Prompt.ask("label_qr_url (optional)", default="")
+        label_qr_text = Prompt.ask("label_qr_text (optional)", default="")
+
+        desc_clean = description.strip()
+        avg_unit_cost = (added_spend_each / qty) if (qty > 0 and added_spend_each > 0) else 0.0
+
+        db.execute(
+            """
+            INSERT INTO parts_received (
+                part_key, vendor, sku, description, desc_clean,
+                label_line1, label_line2, label_short,
+                purchase_url, airtable_url, label_qr_url, label_qr_text,
+                units_received, total_spend, last_invoice, avg_unit_cost, updated_utc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                part_key, vendor, sku, description, desc_clean,
+                label_line1, label_line2, label_short,
+                purchase_url, airtable_url, label_qr_url, label_qr_text,
+                qty, added_spend_each, None, avg_unit_cost, ts,
+            ],
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        part_key, vendor, sku, description, desc_clean,
-        label_line1, label_line2, label_short,
-        purchase_url, airtable_url, label_qr_url, label_qr_text,
-        qty, added_spend, None, avg_unit_cost, ts
-    ])
 
-    console.print("[green]Inserted new part into parts_received.[/green]")
+        db.execute(
+            """
+            INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [str(uuid4()), ts, "receive", part_key, qty, unit_cost_f or None, added_spend_each or None, project, note],
+        )
+
+    console.print("[green]Receive complete.[/green]")
     pause()
+
 
 
 def inv_edit_labels(db: DB):
