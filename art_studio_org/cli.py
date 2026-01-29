@@ -259,7 +259,7 @@ def show_recent_ingests(db: DB):
 
     t = Table(show_header=True, header_style="bold magenta")
     t.add_column("first_seen_utc", style="dim", width=22)
-    t.add_column("vendor", width=12)
+    t.add_column("vendor", width=14)
     t.add_column("order_ref", width=14)
     t.add_column("original_path")
 
@@ -469,7 +469,7 @@ def inv_browse(
 
         t = Table(show_header=True, header_style="bold magenta")
         t.add_column("#", justify="right", style="dim", width=4)
-        t.add_column("vendor", width=10)
+        t.add_column("vendor", width=22)
         t.add_column("sku", width=14)
         t.add_column("label_short")
         t.add_column("on_hand", justify="right", width=8)
