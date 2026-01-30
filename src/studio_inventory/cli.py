@@ -63,6 +63,45 @@ def ensure_inventory_events_table(db: DB) -> None:
         """
     )
 
+
+def _table_exists(db: DB, table: str) -> bool:
+    try:
+        return bool(db.scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [table]))
+    except Exception:
+        return False
+
+def _columns(db: DB, table: str) -> set[str]:
+    try:
+        rows = db.rows(f'PRAGMA table_info("{table}")')
+        return {r["name"] for r in rows}
+    except Exception:
+        return set()
+
+def _ensure_column(db: DB, table: str, col: str, col_type: str) -> None:
+    cols = _columns(db, table)
+    if col in cols:
+        return
+    db.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {col_type}')
+
+def ensure_orders_ingest_schema(db: DB) -> None:
+    """Make older DBs forward-compatible with new ingest metadata columns."""
+    if _table_exists(db, "orders"):
+        for col, typ in [
+            ("archived_path", "TEXT"),
+            ("original_path", "TEXT"),
+            ("order_ref", "TEXT"),
+        ]:
+            _ensure_column(db, "orders", col, typ)
+
+    if _table_exists(db, "ingested_files"):
+        for col, typ in [
+            ("archived_path", "TEXT"),
+            ("original_path", "TEXT"),
+            ("vendor", "TEXT"),
+            ("order_ref", "TEXT"),
+        ]:
+            _ensure_column(db, "ingested_files", col, typ)
+
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
 
@@ -72,6 +111,14 @@ def pause():
 
 def get_db(db_path: Optional[Path] = None) -> DB:
     return DB(path=db_path or default_db_path())
+
+def row_get(row, key, default=None):
+    """sqlite3.Row-safe getter."""
+    try:
+        # sqlite3.Row supports dict-style access
+        return row[key]
+    except Exception:
+        return default
 
 def safe_str(v) -> str:
     return "" if v is None else str(v)
@@ -215,11 +262,11 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists")
-        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
-        menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
-        menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs")
+        menu.add_row("1.", "[bold]Orders[/bold] | View or ingest receipts / packing lists")
+        menu.add_row("2.", "[bold]Export[/bold] | data (CSV / reports)")
+        menu.add_row("3.", "[bold]Inventory[/bold] | browse / search / receive / remove")
+        menu.add_row("4.", "[bold]Vendors[/bold] | enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] | generate PDFs")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -280,6 +327,12 @@ def show_recent_ingests(db: DB):
     header()
     console.print("[bold]Recent ingests[/bold]\n")
 
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "ingested_files"):
+        console.print("[yellow]No ingested files yet.[/yellow] Run an ingest first.")
+        pause()
+        return
+
     try:
         rows = db.rows("""
             SELECT first_seen_utc, vendor, order_ref, original_path, archived_path
@@ -300,13 +353,13 @@ def show_recent_ingests(db: DB):
     t.add_column("original_path")
 
     for r in rows:
-        archived = safe_str(r.get("archived_path"))
+        archived = safe_str(r_get("archived_path"))
         t.add_row(
-            safe_str(r.get("first_seen_utc")),
-            safe_str(r.get("vendor")),
-            safe_str(r.get("order_ref")),
+            safe_str(r_get("first_seen_utc")),
+            safe_str(r_get("vendor")),
+            safe_str(r_get("order_ref")),
             "✅" if archived else "",
-            shorten(r.get("original_path"), 80),
+            shorten(r_get("original_path"), 80),
         )
 
     console.print(t)
@@ -373,6 +426,12 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
         pause()
         return
 
+    ensure_orders_ingest_schema(db)
+    if not _table_exists(db, "orders"):
+        console.print("[yellow]No orders have been ingested yet.[/yellow] Run an ingest first.")
+        pause()
+        return
+
     filters = {"vendor": "", "order_id": "", "date": ""}
     order_by = "(i.first_seen_utc IS NULL), i.first_seen_utc DESC, o.order_uid DESC"
     page = 0
@@ -428,13 +487,15 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
         t.add_column("arch", width=4)
 
         for i, r in enumerate(rows, start=1):
-            arch = safe_str(r.get("archived_path"))
-            total_s = "" if r.get("total") is None else f"{float(r.get('total')):,.2f}"
+            arch = safe_str(row_get(r, "archived_path"))
+            total_val = row_get(r, "total")
+            total_s = "" if total_val is None else f"{float(total_val):,.2f}"
+
             t.add_row(
                 str(i),
-                safe_str(r.get("vendor")),
-                safe_str(r.get("order_id") or r.get("order_ref") or ""),
-                safe_str(r.get("order_date")),
+                safe_str(r_get("vendor")),
+                safe_str(r_get("order_id") or r_get("order_ref") or ""),
+                safe_str(r_get("order_date")),
                 total_s,
                 "✅" if arch else "",
             )
@@ -538,12 +599,12 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         for r in items:
             it.add_row(
-                safe_str(r.get("line")),
-                safe_str(r.get("sku")),
-                shorten(r.get("description"), 60),
-                safe_str(r.get("units_received") or r.get("shipped") or r.get("ordered") or ""),
-                safe_str(r.get("unit_price") or ""),
-                safe_str(r.get("line_total") or ""),
+                safe_str(r_get("line")),
+                safe_str(r_get("sku")),
+                shorten(r_get("description"), 60),
+                safe_str(r_get("units_received") or r_get("shipped") or r_get("ordered") or ""),
+                safe_str(r_get("unit_price") or ""),
+                safe_str(r_get("line_total") or ""),
             )
 
         console.print(it)
