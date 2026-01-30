@@ -125,6 +125,9 @@ def ensure_orders_ingest_schema(db: DB) -> None:
         "archived_path": "TEXT",
         "original_path": "TEXT",
         "order_ref": "TEXT",
+        # soft-delete / void support
+        "is_voided": "INTEGER DEFAULT 0",
+        "voided_utc": "TEXT",
     })
     # Ingested files table (duplicate stopper)
     _ensure_columns(db, "ingested_files", {
@@ -132,7 +135,16 @@ def ensure_orders_ingest_schema(db: DB) -> None:
         "order_ref": "TEXT",
         "original_path": "TEXT",
         "archived_path": "TEXT",
+        # optional: keep hash but mark inactive
+        "is_voided": "INTEGER DEFAULT 0",
     })
+    # Removals table: allow order-level reversals / auditing
+    _ensure_columns(db, "parts_removed", {
+        "order_uid": "TEXT",
+        "file_hash": "TEXT",
+        "reason": "TEXT",
+    })
+
 
 
 def fmt_money(v) -> str:
@@ -477,6 +489,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 o.order_date,
                 o.total,
                 o.file_hash,
+                COALESCE(o.is_voided,0) AS is_voided,
                 i.first_seen_utc,
                 COALESCE(o.archived_path, i.archived_path) AS archived_path,
                 COALESCE(o.original_path, i.original_path) AS original_path,
@@ -495,6 +508,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
         t.add_column("vendor", width=16)
         t.add_column("order", width=14)
         t.add_column("date", width=12)
+        t.add_column("status", width=6)
         t.add_column("total", justify="right", width=10)
         t.add_column("arch", width=4)
 
@@ -506,6 +520,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 safe_str(row_get(r, "vendor")),
                 safe_str(row_get(r, "order_id") or row_get(r, "order_ref") or ""),
                 safe_str(row_get(r, "order_date")),
+                ("VOID" if int(row_get(r, "is_voided") or 0) else ""),
                 total_s,
                 "✅" if arch else "",
             )
@@ -577,6 +592,11 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         body = []
         body.append(f"[bold]Vendor:[/bold] {safe_str(row_get(o, 'vendor'))}")
+        is_voided = bool(int(row_get(o, 'is_voided') or 0))
+        if is_voided:
+            body.append("[bold red]Status:[/bold red] VOIDED")
+        else:
+            body.append("[bold green]Status:[/bold green] ACTIVE")
         body.append(f"[bold]Order:[/bold] {safe_str(row_get(o, 'order_id') or row_get(o, 'order_ref') or '')}")
         body.append(f"[bold]Order date:[/bold] {safe_str(row_get(o, 'order_date'))}")
         body.append(f"[bold]Ingested:[/bold] {safe_str(row_get(o, 'first_seen_utc'))}")
@@ -620,24 +640,69 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         console.print(it)
 
+        
         opts = ["b"]
         prompt = "\n[b] Back"
         if archived:
             opts.append("o")
             prompt += "   [o] Open archived PDF"
-        opts.append("d")
-        prompt += "   [d] Delete this order"
+
+        if not is_voided:
+            opts.append("v")
+            prompt += "   [v] Void this order (log removals)"
+        else:
+            opts.append("u")
+            prompt += "   [u] Undo void (remove those removals)"
+
+        opts.append("p")
+        prompt += "   [p] Purge order (delete rows + hash)"
 
         cmd = Prompt.ask(prompt, choices=opts, default="b")
 
         if cmd == "b":
             return
+
         if cmd == "o" and archived:
             _open_pdf(Path(archived))
             pause()
             continue
-        if cmd == "d":
-            ok = Confirm.ask("Delete this order AND rebuild inventory?", default=False)
+
+        if cmd == "v" and not is_voided:
+            ok = Confirm.ask("Void this order? (adds entries to parts_removed so inventory on-hand stays correct)", default=False)
+            if not ok:
+                continue
+            token = Prompt.ask("Type VOID to confirm", default="")
+            if token.strip() != "VOID":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            try:
+                n = _void_order_to_parts_removed(db, order_uid)
+                console.print(f"[green]Order voided.[/green] Logged {n} removal row(s).")
+            except Exception as e:
+                console.print(f"[red]Void failed:[/red] {e}")
+            pause()
+            continue
+
+        if cmd == "u" and is_voided:
+            ok = Confirm.ask("Undo void? (removes parts_removed rows created by voiding this order)", default=False)
+            if not ok:
+                continue
+            token = Prompt.ask("Type UNVOID to confirm", default="")
+            if token.strip() != "UNVOID":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            try:
+                n = _undo_void_order(db, order_uid)
+                console.print(f"[green]Void undone.[/green] Removed {n} removal row(s).")
+            except Exception as e:
+                console.print(f"[red]Unvoid failed:[/red] {e}")
+            pause()
+            continue
+
+        if cmd == "p":
+            ok = Confirm.ask("Purge this order from the DB? (deletes orders + line_items and clears the duplicate stopper hash)", default=False)
             if not ok:
                 continue
             token = Prompt.ask("Type DELETE to confirm", default="")
@@ -646,22 +711,187 @@ def _show_order_details(db: DB, order_uid: str) -> None:
                 pause()
                 continue
             try:
-                _delete_order_and_rebuild(db, order_uid)
-                console.print("[green]Order deleted. Inventory rebuilt.[/green]")
+                _purge_order_and_rebuild(db, order_uid)
+                console.print("[green]Order purged. Inventory rebuilt.[/green]")
             except Exception as e:
-                console.print(f"[red]Delete failed:[/red] {e}")
+                console.print(f"[red]Purge failed:[/red] {e}")
             pause()
             return
 
 
-def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
-    import sqlite3
-    from datetime import datetime, timezone
 
+
+def _void_order_to_parts_removed(db: DB, order_uid: str) -> int:
+    """Marks an order as voided and logs offsetting removals into parts_removed.
+
+    This preserves history (orders/line_items remain) while keeping inventory_view on_hand consistent.
+    """
+    ensure_orders_ingest_schema(db)
+    ts = utc_now_iso()
+    ensure_inventory_events_table(db)
+
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        o = con.execute(
+            "SELECT order_uid, vendor, order_id, order_ref, order_date, file_hash, COALESCE(is_voided,0) AS is_voided FROM orders WHERE order_uid = ?",
+            [order_uid],
+        ).fetchone()
+        if o is None:
+            raise ValueError("Order not found.")
+        if int(o["is_voided"] or 0) == 1:
+            return 0
+
+        # Aggregate received units per part_key from this order
+        rows = con.execute(
+            """
+            SELECT part_key, SUM(COALESCE(units_received, 0)) AS qty
+            FROM line_items
+            WHERE order_uid = ?
+            GROUP BY part_key
+            HAVING SUM(COALESCE(units_received, 0)) > 0
+            """,
+            [order_uid],
+        ).fetchall()
+
+        vendor = safe_str(o["vendor"])
+        order_label = safe_str(o["order_id"] or o["order_ref"] or "")
+        file_hash = safe_str(o["file_hash"])
+        reason = f"void_order vendor={vendor} order={order_label} uid={order_uid} hash={file_hash}".strip()
+
+        n = 0
+        for r in rows:
+            part_key = safe_str(r["part_key"])
+            qty = float(r["qty"] or 0)
+            if not part_key or qty <= 0:
+                continue
+
+            removal_uid = str(uuid4())
+            con.execute(
+                """
+                INSERT INTO parts_removed (removal_uid, part_key, qty_removed, ts_utc, project, note, updated_utc, order_uid, file_hash, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [removal_uid, part_key, qty, ts, "order_void", reason, ts, order_uid, file_hash, "order_void"],
+            )
+
+            # Unified event log (qty negative for remove)
+            con.execute(
+                """
+                INSERT INTO inventory_events (event_uid, ts_utc, event_type, part_key, qty, unit_cost, total_cost, project, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [str(uuid4()), ts, "order_void", part_key, -qty, None, None, "order_void", reason],
+            )
+            n += 1
+
+        # Mark the order voided
+        con.execute(
+            """
+            UPDATE orders
+            SET is_voided = 1, voided_utc = ?, updated_utc = COALESCE(updated_utc, ?)
+            WHERE order_uid = ?
+            """,
+            [ts, ts, order_uid],
+        )
+        # Optional: mark ingested_files too (does NOT affect duplicate stopper unless ingest code checks it)
+        if file_hash:
+            try:
+                con.execute("UPDATE ingested_files SET is_voided = 1 WHERE file_hash = ?", [file_hash])
+            except Exception:
+                pass
+
+        con.commit()
+
+    return n
+
+
+def _undo_void_order(db: DB, order_uid: str) -> int:
+    """Undo a prior void: deletes the parts_removed rows created by _void_order_to_parts_removed."""
+    ensure_orders_ingest_schema(db)
+    ts = utc_now_iso()
+    ensure_inventory_events_table(db)
+
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+
+        o = con.execute(
+            "SELECT order_uid, file_hash, COALESCE(is_voided,0) AS is_voided FROM orders WHERE order_uid = ?",
+            [order_uid],
+        ).fetchone()
+        if o is None:
+            raise ValueError("Order not found.")
+        if int(o["is_voided"] or 0) == 0:
+            return 0
+
+        file_hash = safe_str(o["file_hash"])
+
+        # Remove the removals we created (tagged by order_uid + reason)
+        cur = con.execute(
+            """
+            DELETE FROM parts_removed
+            WHERE order_uid = ?
+              AND (reason = 'order_void' OR project = 'order_void')
+            """,
+            [order_uid],
+        )
+        removed = int(cur.rowcount or 0)
+
+        # Also remove matching inventory_events (best-effort)
+        try:
+            con.execute(
+                """
+                DELETE FROM inventory_events
+                WHERE event_type = 'order_void'
+                  AND note LIKE ?
+                """,
+                [f"%uid={order_uid}%"],
+            )
+        except Exception:
+            pass
+
+        # Unmark order
+        con.execute(
+            """
+            UPDATE orders
+            SET is_voided = 0, voided_utc = NULL, updated_utc = COALESCE(updated_utc, ?)
+            WHERE order_uid = ?
+            """,
+            [ts, order_uid],
+        )
+        if file_hash:
+            try:
+                con.execute("UPDATE ingested_files SET is_voided = 0 WHERE file_hash = ?", [file_hash])
+            except Exception:
+                pass
+
+        con.commit()
+
+    return removed
+
+
+def _purge_order_and_rebuild(db: DB, order_uid: str) -> None:
+    """Hard-delete the order + line items and clear its hash, then rebuild parts_received/inventory.
+
+    This is the "I want to ingest again" path.
+    """
     with db.connect() as con:
         con.execute("PRAGMA foreign_keys = ON;")
         row = con.execute("SELECT file_hash FROM orders WHERE order_uid = ?", [order_uid]).fetchone()
         file_hash = None if row is None else row[0]
+
+        # If this order was voided, remove the void removals too (so inventory doesn't stay offset).
+        try:
+            con.execute(
+                """
+                DELETE FROM parts_removed
+                WHERE order_uid = ?
+                  AND (reason = 'order_void' OR project = 'order_void')
+                """,
+                [order_uid],
+            )
+        except Exception:
+            pass
 
         con.execute("DELETE FROM line_items WHERE order_uid = ?", [order_uid])
         con.execute("DELETE FROM orders WHERE order_uid = ?", [order_uid])
@@ -674,6 +904,12 @@ def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
 
         _rebuild_parts_received_and_inventory(con)
         con.commit()
+
+
+def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
+    # Backwards-compat wrapper
+    _purge_order_and_rebuild(db, order_uid)
+
 
 
 def _rebuild_parts_received_and_inventory(con) -> None:
