@@ -35,15 +35,9 @@ from studio_inventory.db import DB, default_db_path
 from studio_inventory.labels.make_pdf import make_labels_pdf, LabelTemplate
 from studio_inventory.labels.presets import list_label_presets, load_label_preset, save_label_preset
 
-@app.callback(invoke_without_command=True)
-def _main(ctx: typer.Context):
-    """
-    Menu-first CLI (default). If a subcommand is provided, run it.
-    """
-    if ctx.invoked_subcommand is None:
-        _run_main_menu()
-
 app = typer.Typer(add_completion=False, no_args_is_help=False)
+console = Console()
+
 console = Console()
 
 
@@ -209,6 +203,7 @@ def export_sqlite_object_to_csv(
 # ----------------------------
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
+    """Launch the menu UI when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
         run_menu()
 
@@ -1492,6 +1487,28 @@ def menu_labels():
             labels_generate(db)
 
 
+
+@app.command()
+def inventory():
+    """Interactive inventory browser (browse/search/receive/remove/labels fields)."""
+    ensure_workspace()
+    menu_inventory()
+
+
+@app.command()
+def labels():
+    """Interactive label generator (PDF)."""
+    ensure_workspace()
+    menu_labels()
+
+
+@app.command()
+def diagnostics():
+    """Database diagnostics (schema checks, quick stats)."""
+    ensure_workspace()
+    menu_db_diagnostics()
+
+
 # ----------------------------
 # Subcommands
 # ----------------------------
@@ -1589,43 +1606,3 @@ def init():
     typer.echo("  - label_presets/")
     typer.echo("  - secrets/")
 
-def _run_main_menu() -> None:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.prompt import Prompt
-
-    console = Console()
-
-    while True:
-        console.print(Panel.fit(
-            "[bold]Studio Inventory[/bold]\n[dim]Menu-first CLI[/dim]",
-            border_style="cyan"
-        ))
-
-        console.print("  1. Ingest receipts / packing lists")
-        console.print("  2. Export data (CSV)")
-        console.print("  3. Inventory browse / search / receive / remove  [dim](coming back next)[/dim]")
-        console.print("  4. Vendors enrich (McMaster / DigiKey)           [dim](coming back next)[/dim]")
-        console.print("  5. Labels generate PDFs                          [dim](coming back next)[/dim]")
-        console.print("  6. DB diagnostics                                [dim](coming back next)[/dim]")
-        console.print("  0. Quit")
-
-        choice = Prompt.ask("\nChoose [1/2/3/4/5/6/0]", default="0").strip()
-
-        if choice == "0":
-            return
-
-        if choice == "1":
-            # Run the existing ingest program (interactive)
-            subprocess.run([sys.executable, "-m", "studio_inventory.main"], check=False)
-            continue
-
-        if choice == "2":
-            # Drop into the export subcommand help (or implement interactive export picker later)
-            subprocess.run([sys.executable, "-m", "studio_inventory.cli", "export", "--help"], check=False)
-            continue
-
-        console.print("[yellow]That menu option isn’t re-wired yet in the installable CLI.[/yellow]\n")
-
-if __name__ == "__main__":
-    app()

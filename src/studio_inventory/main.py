@@ -270,7 +270,6 @@ def pick_export_folder(default_dir: Path) -> Path | None:
         candidate = (Path.cwd() / candidate).resolve()
     return candidate
 
-
 # ----------------------------
 # Ingest helpers + normalization
 # ----------------------------
@@ -285,7 +284,6 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 class IngestRegistry:
     """
@@ -329,7 +327,6 @@ class IngestRegistry:
             """, (file_hash, datetime.utcnow().isoformat(), str(pdf_path), vendor, order_ref))
             conn.commit()
 
-
 def move_to_duplicates(pdf_path: Path, duplicates_dir: Path) -> Path:
     """
     Move pdf_path into duplicates_dir, de-conflicting filename if needed.
@@ -358,7 +355,6 @@ def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     return _WS.sub(" ", s)
 
-
 def make_order_uid(*, vendor: str, order_ref: str, file_hash: str) -> str:
     """
     Stable-ish order ID.
@@ -366,7 +362,6 @@ def make_order_uid(*, vendor: str, order_ref: str, file_hash: str) -> str:
     """
     key = "|".join([_norm(vendor), _norm(order_ref), file_hash])
     return str(uuid.uuid5(_NAMESPACE_ORDER, key))
-
 
 def make_line_item_uid(
     *,
@@ -556,7 +551,6 @@ def make_label_short(label_line1: str, label_line2: str, *, sku: str = "", mfg_p
     if len(base) > max_len:
         base = base[: max_len - 3].rstrip() + "..."
     return base
-
 
 def to_int(x):
     try:
