@@ -18,7 +18,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root, imports_run_dir
+from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root
 
 # ----------------------------
 # Simple run logger
@@ -73,31 +73,6 @@ def create_run_log(echo: bool = True) -> RunLogger:
     logger.log(f"Workspace root: {root}")
     logger.log(f"CWD: {Path.cwd().resolve()}")
     return logger
-
-
-# ----------------------------
-# Ingest archive (imports/YYYY-MM-DD)
-# ----------------------------
-
-def archive_pdf_to_imports(src_pdf: Path, run_dir: Path) -> Path:
-    """Copy src_pdf into run_dir, avoiding name collisions.
-
-    Returns the destination path.
-    """
-    run_dir.mkdir(parents=True, exist_ok=True)
-    dest = run_dir / src_pdf.name
-    if dest.exists():
-        stem, suffix = src_pdf.stem, src_pdf.suffix
-        i = 2
-        while True:
-            candidate = run_dir / f"{stem}__{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-
-    shutil.copy2(str(src_pdf), str(dest))
-    return dest
 
 
 # ----------------------------
@@ -207,10 +182,6 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
     needle = choice
     return [p for p in pdfs if needle in p.name.lower()]
 
-
-# ----------------------------
-# Imports archive (photo-manager style)
-# ----------------------------
 
 # ----------------------------
 # Export folder picker
@@ -629,11 +600,11 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     registry = IngestRegistry(db_path())
     seen_hashes: set[str] = set()
 
-    # Archive all ingested PDFs to workspace imports/YYYY-MM-DD/
-    run_import_dir = imports_run_dir()
-    log = (logger.log if logger else print)
-    log(f"Ingest archive folder: {run_import_dir}")
-    _log = log
+    def log(msg: str):
+        if logger:
+            logger.log(msg)
+        else:
+            print(msg)
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
@@ -654,41 +625,30 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
         if dup_reason:
             try:
                 moved = move_to_duplicates(pdf_path, pdf_path.parent / "duplicates")
-                _log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
+                log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
             except Exception:
-                _log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {pdf_path}\n")
+                log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {pdf_path}\n")
             continue
 
         seen_hashes.add(file_hash)
 
-        # Copy the original PDF into the workspace imports folder and parse from the archived copy.
-        try:
-            archived_pdf = archive_pdf_to_imports(pdf_path, run_import_dir)
-            _log(f"  ARCHIVED -> {archived_pdf}")
-        except Exception:
-            archived_pdf = pdf_path
-            if logger:
-                logger.exception(f"Failed to archive PDF: {pdf_path}")
-            else:
-                print(f"[WARN] Failed to archive PDF: {pdf_path}")
-
-        parser = pick_parser(str(archived_pdf))
+        parser = pick_parser(str(pdf_path))
         parser_name = getattr(parser, "__name__", None) if parser else "(none)"
 
-        _log(f"FILE: {pdf_path.name}")
-        _log(f"  PATH: {pdf_path}")
-        _log(f"  PARSER: {parser_name}")
+        log(f"FILE: {pdf_path.name}")
+        log(f"  PATH: {pdf_path}")
+        log(f"  PARSER: {parser_name}")
 
         if parser is None:
-            _log("  RESULT: SKIPPED (no parser matched)\n")
+            log("  RESULT: SKIPPED (no parser matched)\n")
             continue
 
         if debug:
-            print(f"\n=== Processing: {archived_pdf.name} ===")
+            print(f"\n=== Processing: {pdf_path.name} ===")
             print(f"Using parser: {parser_name}")
 
         try:
-            info = _dictify(parser.parse_order(str(archived_pdf), debug=debug))
+            info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
             vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
 
             order_ref = str(info.get("invoice") or info.get("purchase_order") or "")
@@ -712,9 +672,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                 "total": info.get("total"),
             })
 
-            items = parser.parse_line_items(str(archived_pdf), debug=debug) or []
-            _log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
-            _log(f"  LINE_ITEMS: {len(items)} parsed")
+            items = parser.parse_line_items(str(pdf_path), debug=debug) or []
+            log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
+            log(f"  LINE_ITEMS: {len(items)} parsed")
 
             for idx, d in enumerate(items, start=1):
                 line_idx = d.get("line")
@@ -757,7 +717,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             # Mark this PDF as ingested only after successful parse
             registry.register(file_hash=file_hash, pdf_path=pdf_path, vendor=vendor, order_ref=order_ref)
 
-            _log("  RESULT: OK\n")
+            log("  RESULT: OK\n")
 
         except Exception:
             if logger:
@@ -765,7 +725,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             else:
                 print(f"[ERROR] Failed parsing {pdf_path.name} with parser={parser_name}")
                 traceback.print_exc()
-            _log("")
+            log("")
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
@@ -1232,6 +1192,14 @@ def main():
             print("(empty)")
         else:
             print(parts_received_df.sort_values("total_spend", ascending=False).head(20).to_string(index=False))
+
+        # ----------------------------
+        # Confirm before writing to DB
+        # ----------------------------
+        # This is intentionally a simple, reliable guardrail: users can dry-run
+        # parsing + CSV export without mutating the SQLite database.
+        apply_db = (input("\nApply this ingest to the SQLite database? [y/N]: ").strip().lower() == "y")
+        logger.log(f"Apply DB update: {apply_db}")
         # this was commented out becuase it would place the default folder inside where we grabbed reciepts, not
         # the default 'exports' folder of the project:
         #default_export_dir = (receipts_folder.parent / "exports").resolve()
@@ -1265,24 +1233,30 @@ def main():
         logger.log(f"  {received_csv}")
         logger.log(f"  {removed_csv}")
 
-        # Update SQLite database + refresh inventory snapshot
-        inventory_on_hand_df = update_database(
-            orders_df,
-            line_items_df,
-            parts_received_df,
-            parts_removed_df,
-            dbfile=db_path(),
-            logger=logger
-        )
-        inventory_on_hand_df.to_csv(inv_csv, index=False)
-        logger.log(f"  {inv_csv}")
+        # Update SQLite database + refresh inventory snapshot (optional)
+        if apply_db:
+            inventory_on_hand_df = update_database(
+                orders_df,
+                line_items_df,
+                parts_received_df,
+                parts_removed_df,
+                dbfile=db_path(),
+                logger=logger
+            )
+            inventory_on_hand_df.to_csv(inv_csv, index=False)
+            logger.log(f"  {inv_csv}")
+        else:
+            logger.log("DB update skipped by user (dry-run).")
 
         print("\n✅ CSV files saved:")
         print(" ", orders_csv)
         print(" ", items_csv)
         print(" ", received_csv)
         print(" ", removed_csv)
-        print(" ", inv_csv)
+        if apply_db:
+            print(" ", inv_csv)
+        else:
+            print(" (DB update skipped; inventory_on_hand not written)")
 
     finally:
         logger.close()
