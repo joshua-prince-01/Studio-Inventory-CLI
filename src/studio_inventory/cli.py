@@ -243,6 +243,7 @@ def run_menu():
             return
 
 
+
 # ----------------------------
 # Ingest (wired)
 # ----------------------------
@@ -256,18 +257,23 @@ def menu_ingest():
 
         menu = Table(show_header=False, box=None)
         menu.add_row("1.", "Run ingest")
-        menu.add_row("2.", "Show recent ingested files")
+        menu.add_row("2.", "Browse orders / receipts")
+        menu.add_row("3.", "Show recent ingested files")
         menu.add_row("0.", "Back")
         console.print(menu)
 
-        choice = Prompt.ask("\nChoose", choices=["1", "2", "0"], default="1")
+        choice = Prompt.ask("\nChoose", choices=["1", "2", "3", "0"], default="1")
         if choice == "0":
             return
         if choice == "1":
             run_ingest()
             pause()
         elif choice == "2":
+            orders_browse(db)
+        elif choice == "3":
             show_recent_ingests(db)
+
+
 
 def show_recent_ingests(db: DB):
     console.clear()
@@ -276,7 +282,7 @@ def show_recent_ingests(db: DB):
 
     try:
         rows = db.rows("""
-            SELECT first_seen_utc, vendor, order_ref, original_path
+            SELECT first_seen_utc, vendor, order_ref, original_path, archived_path
             FROM ingested_files
             ORDER BY first_seen_utc DESC
             LIMIT 30
@@ -288,20 +294,378 @@ def show_recent_ingests(db: DB):
 
     t = Table(show_header=True, header_style="bold magenta")
     t.add_column("first_seen_utc", style="dim", width=22)
-    t.add_column("vendor", width=20)
+    t.add_column("vendor", width=18)
     t.add_column("order_ref", width=14)
+    t.add_column("archived", width=7)
     t.add_column("original_path")
 
     for r in rows:
+        archived = safe_str(r.get("archived_path"))
         t.add_row(
-            safe_str(r["first_seen_utc"]),
-            safe_str(r["vendor"]),
-            safe_str(r["order_ref"]),
-            shorten(r["original_path"], 90),
+            safe_str(r.get("first_seen_utc")),
+            safe_str(r.get("vendor")),
+            safe_str(r.get("order_ref")),
+            "✅" if archived else "",
+            shorten(r.get("original_path"), 80),
         )
 
     console.print(t)
     pause()
+
+
+# ----------------------------
+# Orders / receipts browser
+# ----------------------------
+
+def _orders_where(filters: dict[str, str]) -> tuple[str, list[str]]:
+    wh = []
+    params: list[str] = []
+
+    v = (filters.get("vendor") or "").strip()
+    if v:
+        wh.append("o.vendor LIKE ?")
+        params.append(f"%{v}%")
+
+    oid = (filters.get("order_id") or "").strip()
+    if oid:
+        wh.append("o.order_id LIKE ?")
+        params.append(f"%{oid}%")
+
+    d = (filters.get("date") or "").strip()
+    if d:
+        wh.append("o.order_date LIKE ?")
+        params.append(f"%{d}%")
+
+    where = "" if not wh else "WHERE " + " AND ".join(wh)
+    return where, params
+
+
+def _orders_filter_prompt(filters: dict[str, str]) -> dict[str, str]:
+    console.print("\n[bold]Filter orders[/bold]  [dim](Enter keeps current, '*' clears a field)[/dim]")
+    vendor = Prompt.ask("Vendor contains", default=filters.get("vendor", ""))
+    order_id = Prompt.ask("Order # contains", default=filters.get("order_id", ""))
+    date = Prompt.ask("Date contains", default=filters.get("date", ""))
+
+    def norm(s: str) -> str:
+        s = (s or "").strip()
+        return "" if s == "*" else s
+
+    return {"vendor": norm(vendor), "order_id": norm(order_id), "date": norm(date)}
+
+
+def _orders_sort_prompt() -> str:
+    console.print("\n[bold]Sort orders[/bold]")
+    console.print("  1) newest ingested (default)")
+    console.print("  2) vendor, order")
+    console.print("  3) total desc")
+    choice = Prompt.ask("Choose", choices=["1","2","3"], default="1")
+    if choice == "2":
+        return "o.vendor, o.order_id"
+    if choice == "3":
+        return "COALESCE(o.total, 0) DESC, o.vendor"
+    # Newest ingested (first_seen_utc is ISO)
+    return "(i.first_seen_utc IS NULL), i.first_seen_utc DESC, o.order_uid DESC"
+
+
+def orders_browse(db: DB, *, page_size: int = 20) -> None:
+    if not db.path.exists():
+        console.print(f"[red]DB not found:[/red] {db.path}")
+        pause()
+        return
+
+    filters = {"vendor": "", "order_id": "", "date": ""}
+    order_by = "(i.first_seen_utc IS NULL), i.first_seen_utc DESC, o.order_uid DESC"
+    page = 0
+
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]Orders / receipts[/bold]  [dim](row # details; n/p page; f filter; s sort; q back)[/dim]\n")
+
+        where, params = _orders_where(filters)
+
+        try:
+            total = int(db.scalar(
+                f"SELECT COUNT(*) FROM orders o LEFT JOIN ingested_files i ON i.file_hash = o.file_hash {where}",
+                params,
+            ) or 0)
+        except Exception as e:
+            console.print(f"[red]Query failed:[/red] {e}")
+            pause()
+            return
+
+        max_page = 0 if total == 0 else (total - 1) // page_size
+        page = max(0, min(page, max_page))
+        offset = page * page_size
+
+        sql = f"""
+            SELECT
+                o.order_uid,
+                o.vendor,
+                o.order_id,
+                o.order_date,
+                o.total,
+                o.file_hash,
+                i.first_seen_utc,
+                COALESCE(o.archived_path, i.archived_path) AS archived_path,
+                COALESCE(o.original_path, i.original_path) AS original_path,
+                COALESCE(o.order_ref, i.order_ref) AS order_ref
+            FROM orders o
+            LEFT JOIN ingested_files i ON i.file_hash = o.file_hash
+            {where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+        """
+
+        rows = db.rows(sql, params + [page_size, offset])
+
+        t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("#", justify="right", width=4)
+        t.add_column("vendor", width=16)
+        t.add_column("order", width=14)
+        t.add_column("date", width=12)
+        t.add_column("total", justify="right", width=10)
+        t.add_column("arch", width=4)
+
+        for i, r in enumerate(rows, start=1):
+            arch = safe_str(r.get("archived_path"))
+            total_s = "" if r.get("total") is None else f"{float(r.get('total')):,.2f}"
+            t.add_row(
+                str(i),
+                safe_str(r.get("vendor")),
+                safe_str(r.get("order_id") or r.get("order_ref") or ""),
+                safe_str(r.get("order_date")),
+                total_s,
+                "✅" if arch else "",
+            )
+
+        console.print(t)
+        console.print(f"\n[dim]Page {page+1}/{max_page+1}  •  {total} orders  •  Filters: vendor='{filters['vendor']}' order='{filters['order_id']}' date='{filters['date']}'[/dim]")
+
+        cmd = Prompt.ask("\nCommand")
+        cmd = (cmd or "").strip().lower()
+
+        if cmd in {"q", "0", "back"}:
+            return
+        if cmd in {"n", "next"}:
+            page = min(page + 1, max_page)
+            continue
+        if cmd in {"p", "prev", "previous"}:
+            page = max(page - 1, 0)
+            continue
+        if cmd in {"f", "filter"}:
+            filters = _orders_filter_prompt(filters)
+            page = 0
+            continue
+        if cmd in {"s", "sort"}:
+            order_by = _orders_sort_prompt()
+            page = 0
+            continue
+
+        if cmd.isdigit():
+            idx = int(cmd)
+            if 1 <= idx <= len(rows):
+                _show_order_details(db, rows[idx - 1]["order_uid"])
+            else:
+                console.print("[yellow]Row out of range.[/yellow]")
+                pause()
+            continue
+
+        console.print("[dim]Commands: row#, n, p, f, s, q[/dim]")
+        pause()
+
+
+def _show_order_details(db: DB, order_uid: str) -> None:
+    while True:
+        console.clear()
+        header()
+
+        o = db.rows(
+            """
+            SELECT
+                o.*,
+                i.first_seen_utc,
+                COALESCE(o.archived_path, i.archived_path) AS archived_path,
+                COALESCE(o.original_path, i.original_path) AS original_path,
+                COALESCE(o.order_ref, i.order_ref) AS order_ref
+            FROM orders o
+            LEFT JOIN ingested_files i ON i.file_hash = o.file_hash
+            WHERE o.order_uid = ?
+            """,
+            [order_uid],
+        )
+        if not o:
+            console.print("[yellow]Order not found.[/yellow]")
+            pause()
+            return
+        o = o[0]
+
+        archived = safe_str(o.get("archived_path"))
+        original = safe_str(o.get("original_path"))
+
+        body = []
+        body.append(f"[bold]Vendor:[/bold] {safe_str(o.get('vendor'))}")
+        body.append(f"[bold]Order:[/bold] {safe_str(o.get('order_id') or o.get('order_ref') or '')}")
+        body.append(f"[bold]Order date:[/bold] {safe_str(o.get('order_date'))}")
+        body.append(f"[bold]Ingested:[/bold] {safe_str(o.get('first_seen_utc'))}")
+        body.append(f"[bold]Total:[/bold] {safe_str(o.get('total'))}")
+        body.append(f"[bold]File hash:[/bold] {safe_str(o.get('file_hash'))}")
+        if archived:
+            body.append(f"[bold]Archived PDF:[/bold] {archived}")
+        if original:
+            body.append(f"[bold]Original path:[/bold] {original}")
+
+        console.print(Panel.fit("\n".join(body), title="Order details", border_style="cyan"))
+
+        items = db.rows(
+            """
+            SELECT line, sku, description, ordered, shipped, units_received, unit_price, line_total
+            FROM line_items
+            WHERE order_uid = ?
+            ORDER BY line
+            LIMIT 200
+            """,
+            [order_uid],
+        )
+
+        it = Table(show_header=True, header_style="bold magenta")
+        it.add_column("line", justify="right", width=4)
+        it.add_column("sku", width=14)
+        it.add_column("description")
+        it.add_column("qty", justify="right", width=6)
+        it.add_column("unit", justify="right", width=9)
+        it.add_column("total", justify="right", width=10)
+
+        for r in items:
+            it.add_row(
+                safe_str(r.get("line")),
+                safe_str(r.get("sku")),
+                shorten(r.get("description"), 60),
+                safe_str(r.get("units_received") or r.get("shipped") or r.get("ordered") or ""),
+                safe_str(r.get("unit_price") or ""),
+                safe_str(r.get("line_total") or ""),
+            )
+
+        console.print(it)
+
+        opts = ["b"]
+        prompt = "\n[b] Back"
+        if archived:
+            opts.append("o")
+            prompt += "   [o] Open archived PDF"
+        opts.append("d")
+        prompt += "   [d] Delete this order"
+
+        cmd = Prompt.ask(prompt, choices=opts, default="b")
+
+        if cmd == "b":
+            return
+        if cmd == "o" and archived:
+            _open_pdf(Path(archived))
+            pause()
+            continue
+        if cmd == "d":
+            ok = Confirm.ask("Delete this order AND rebuild inventory?", default=False)
+            if not ok:
+                continue
+            token = Prompt.ask("Type DELETE to confirm", default="")
+            if token.strip() != "DELETE":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            try:
+                _delete_order_and_rebuild(db, order_uid)
+                console.print("[green]Order deleted. Inventory rebuilt.[/green]")
+            except Exception as e:
+                console.print(f"[red]Delete failed:[/red] {e}")
+            pause()
+            return
+
+
+def _delete_order_and_rebuild(db: DB, order_uid: str) -> None:
+    import sqlite3
+    from datetime import datetime, timezone
+
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+        row = con.execute("SELECT file_hash FROM orders WHERE order_uid = ?", [order_uid]).fetchone()
+        file_hash = None if row is None else row[0]
+
+        con.execute("DELETE FROM line_items WHERE order_uid = ?", [order_uid])
+        con.execute("DELETE FROM orders WHERE order_uid = ?", [order_uid])
+
+        # remove file hash record if no orders remain for that hash
+        if file_hash:
+            remain = con.execute("SELECT COUNT(*) FROM orders WHERE file_hash = ?", [file_hash]).fetchone()[0]
+            if int(remain) == 0:
+                con.execute("DELETE FROM ingested_files WHERE file_hash = ?", [file_hash])
+
+        _rebuild_parts_received_and_inventory(con)
+        con.commit()
+
+
+def _rebuild_parts_received_and_inventory(con) -> None:
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    # Rebuild parts_received from current line_items
+    con.execute("DELETE FROM parts_received;")
+    con.execute(
+        """
+        INSERT INTO parts_received(
+            part_key, vendor, sku, description, desc_clean,
+            label_line1, label_line2, label_short,
+            purchase_url, airtable_url, label_qr_url, label_qr_text,
+            units_received, total_spend, last_invoice, avg_unit_cost, updated_utc
+        )
+        SELECT
+            part_key,
+            MIN(vendor) AS vendor,
+            MIN(sku) AS sku,
+            MIN(description) AS description,
+            MIN(desc_clean) AS desc_clean,
+            MIN(label_line1) AS label_line1,
+            MIN(label_line2) AS label_line2,
+            MIN(label_short) AS label_short,
+            MIN(purchase_url) AS purchase_url,
+            MIN(airtable_url) AS airtable_url,
+            MIN(label_qr_url) AS label_qr_url,
+            MIN(label_qr_text) AS label_qr_text,
+            SUM(COALESCE(units_received, 0)) AS units_received,
+            SUM(COALESCE(line_total, 0)) AS total_spend,
+            MAX(invoice) AS last_invoice,
+            CASE WHEN SUM(COALESCE(units_received,0)) = 0 THEN NULL
+                 ELSE SUM(COALESCE(line_total,0)) / SUM(COALESCE(units_received,0))
+            END AS avg_unit_cost,
+            ? AS updated_utc
+        FROM line_items
+        GROUP BY part_key
+        """,
+        [ts],
+    )
+
+    # Refresh materialized inventory snapshot from inventory_view
+    con.execute("DELETE FROM inventory;")
+    con.execute(
+        """
+        INSERT INTO inventory(
+            part_key, vendor, sku, description, desc_clean,
+            label_line1, label_line2, label_short,
+            purchase_url, airtable_url, label_qr_url,
+            units_received, units_removed, on_hand,
+            avg_unit_cost, total_spend, last_invoice, updated_utc
+        )
+        SELECT
+            part_key, vendor, sku, description, desc_clean,
+            label_line1, label_line2, label_short,
+            purchase_url, airtable_url, label_qr_url,
+            units_received, units_removed, on_hand,
+            avg_unit_cost, total_spend, last_invoice, ?
+        FROM inventory_view
+        """,
+        [ts],
+    )
 
 # ----------------------------
 # Export (implemented)
@@ -998,47 +1362,106 @@ def inv_edit_labels(db: DB):
 # ----------------------------
 # DB diagnostics
 # ----------------------------
+
+
 def menu_db_diagnostics():
     db_path = default_db_path()
 
-    console.clear()
-    header()
-    console.print("[bold]DB diagnostics[/bold]\n")
-    console.print(f"DB path: [cyan]{db_path}[/cyan]")
-    console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
-
     if not db_path.exists():
+        console.clear()
+        header()
+        console.print("[bold]DB diagnostics[/bold]\n")
+        console.print(f"DB path: [cyan]{db_path}[/cyan]")
+        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
         pause()
         return
 
     db = get_db()
 
-    tables = db.rows("""
-        SELECT name, type
-        FROM sqlite_master
-        WHERE type IN ('table','view')
-          AND name NOT LIKE 'sqlite_%'
-        ORDER BY type, name
-    """)
+    while True:
+        console.clear()
+        header()
+        console.print("[bold]DB diagnostics[/bold]\n")
+        console.print(f"DB path: [cyan]{db_path}[/cyan]")
+        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
 
-    t = Table(show_header=True, header_style="bold magenta")
-    t.add_column("type", width=6)
-    t.add_column("name")
-    t.add_column("rows", justify="right", width=8)
+        tables = db.rows("""
+            SELECT name, type
+            FROM sqlite_master
+            WHERE type IN ('table','view')
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+        """)
 
-    for row in tables:
-        name = row["name"]
-        typ = row["type"]
-        count = ""
-        if typ == "table":
+        t = Table(show_header=True, header_style="bold magenta")
+        t.add_column("type", width=6)
+        t.add_column("name")
+        t.add_column("rows", justify="right", width=8)
+
+        for row in tables:
+            name = row["name"]
+            typ = row["type"]
+            count = ""
+            if typ == "table":
+                try:
+                    count = str(db.scalar(f'SELECT COUNT(*) FROM "{name}"') or 0)
+                except Exception:
+                    count = "?"
+            t.add_row(typ, name, count)
+
+        console.print(t)
+
+        menu = Table(show_header=False, box=None)
+        menu.add_row("1.", "Reset database (clear all data)")
+        menu.add_row("0.", "Back")
+        console.print("\n")
+        console.print(menu)
+
+        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="0")
+        if choice == "0":
+            return
+
+        if choice == "1":
+            console.print("\n[red][bold]DANGER[/bold][/red] This will permanently delete ALL data in your DB.")
+            ok = Confirm.ask("Continue?", default=False)
+            if not ok:
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+            token = Prompt.ask("Type RESET to confirm", default="")
+            if token.strip() != "RESET":
+                console.print("[yellow]Cancelled.[/yellow]")
+                pause()
+                continue
+
             try:
-                count = str(db.scalar(f"SELECT COUNT(*) FROM {name}") or 0)
-            except Exception:
-                count = "?"
-        t.add_row(typ, name, count)
+                _reset_database_contents(db)
+                console.print("[green]Database cleared.[/green]")
+            except Exception as e:
+                console.print(f"[red]Reset failed:[/red] {e}")
+            pause()
 
-    console.print(t)
-    pause()
+
+def _reset_database_contents(db: DB) -> None:
+    """Delete all rows from all user tables (keeps schema)."""
+    with db.connect() as con:
+        con.execute("PRAGMA foreign_keys = OFF;")
+        tables = con.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table'
+              AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+
+        # deterministic order helps with debugging
+        names = sorted([r[0] for r in tables])
+        for name in names:
+            con.execute(f'DELETE FROM "{name}";')
+
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.commit()
 
 # ----------------------------
 # Future stubs
