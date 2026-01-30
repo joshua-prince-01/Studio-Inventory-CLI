@@ -117,7 +117,7 @@ def timestamp_slug() -> str:
 
 
 # ----------------------------
-# Legacy ingest runner (subprocess)
+# Ingest runner (subprocess)
 # ----------------------------
 def run_module_in_subprocess(module_name: str) -> int:
     """
@@ -137,22 +137,30 @@ def run_module_in_subprocess(module_name: str) -> int:
         console.print("\n[yellow]Cancelled.[/yellow]")
         return 130
 
-def run_legacy_ingest() -> None:
+def run_ingest() -> None:
+    """Run the ingest entrypoint in a subprocess.
+
+    Return codes (child process):
+      - 0   success (DB updated)
+      - 2   cancelled / dry-run (DB not updated)
+      - 130 interrupted (Ctrl+C)
     """
-    Tries the most likely current entrypoint first.
-    """
-    # 1) Try the existing "main" flow
     rc = run_module_in_subprocess("studio_inventory.main")
     if rc == 0:
         console.print("[green]Ingest completed.[/green]")
         return
+    if rc in (2, 130):
+        console.print("[yellow]Ingest cancelled.[/yellow]")
+        return
 
     console.print(f"[yellow]studio_inventory.main exited with code {rc}. Trying fallback…[/yellow]")
 
-    # 2) Fallback: ingest_all
     rc2 = run_module_in_subprocess("studio_inventory.ingest_all")
     if rc2 == 0:
         console.print("[green]Ingest completed.[/green]")
+        return
+    if rc2 in (2, 130):
+        console.print("[yellow]Ingest cancelled.[/yellow]")
         return
 
     console.print(f"[red]Ingest failed.[/red] exit codes: main={rc}, ingest_all={rc2}")
@@ -247,7 +255,7 @@ def menu_ingest():
         console.print("[bold]Ingest[/bold]\n")
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Run ingest (legacy flow)")
+        menu.add_row("1.", "Run ingest")
         menu.add_row("2.", "Show recent ingested files")
         menu.add_row("0.", "Back")
         console.print(menu)
@@ -256,7 +264,7 @@ def menu_ingest():
         if choice == "0":
             return
         if choice == "1":
-            run_legacy_ingest()
+            run_ingest()
             pause()
         elif choice == "2":
             show_recent_ingests(db)
@@ -1545,7 +1553,7 @@ def ingest(
     if workspace:
         os.environ["STUDIO_INV_HOME"] = str(Path(workspace).expanduser().resolve())
     ensure_workspace()
-    run_legacy_ingest()
+    run_ingest()
 
 
 @app.command()

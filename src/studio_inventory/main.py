@@ -14,11 +14,12 @@ import shutil
 import sqlite3
 import uuid
 import os
+import sys
 from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root
+from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root, imports_run_dir
 
 # ----------------------------
 # Simple run logger
@@ -277,6 +278,22 @@ def pick_export_folder(default_dir: Path) -> Path | None:
 # ----------------------------
 # Ingest integrity: duplicate detection + stable IDs
 # ----------------------------
+def archive_pdf_to_imports(original_path: Path, run_dir: Path) -> Path:
+    """Copy an original PDF into workspace imports/YYYY-MM-DD/, returning the archived path."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = run_dir / original_path.name
+    if dest.exists():
+        stem, suffix = original_path.stem, original_path.suffix
+        i = 2
+        while True:
+            cand = run_dir / f"{stem}__{i}{suffix}"
+            if not cand.exists():
+                dest = cand
+                break
+            i += 1
+    shutil.copy2(str(original_path), str(dest))
+    return dest
+
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
@@ -305,10 +322,18 @@ class IngestRegistry:
                     file_hash TEXT PRIMARY KEY,
                     first_seen_utc TEXT NOT NULL,
                     original_path TEXT,
+                    archived_path TEXT,
                     vendor TEXT,
                     order_ref TEXT
                 );
             """)
+            # Migrate older DBs (add archived_path if missing)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(ingested_files);").fetchall()}
+            if "archived_path" not in cols:
+                conn.execute("ALTER TABLE ingested_files ADD COLUMN archived_path TEXT;")
+            if "order_ref" not in cols and "order_id" in cols:
+                # keep old column; add order_ref for new code
+                conn.execute("ALTER TABLE ingested_files ADD COLUMN order_ref TEXT;")
             conn.commit()
 
     def has_hash(self, file_hash: str) -> bool:
@@ -319,12 +344,31 @@ class IngestRegistry:
             ).fetchone()
         return row is not None
 
-    def register(self, *, file_hash: str, pdf_path: Path, vendor: str | None = None, order_ref: str | None = None):
+    def register(
+        self,
+        *,
+        file_hash: str,
+        original_path: Path,
+        archived_path: Path | None = None,
+        vendor: str | None = None,
+        order_ref: str | None = None,
+        first_seen_utc: str | None = None,
+    ):
+        first_seen_utc = first_seen_utc or datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute("""
-                INSERT OR IGNORE INTO ingested_files(file_hash, first_seen_utc, original_path, vendor, order_ref)
-                VALUES (?, ?, ?, ?, ?);
-            """, (file_hash, datetime.utcnow().isoformat(), str(pdf_path), vendor, order_ref))
+                INSERT OR REPLACE INTO ingested_files(
+                    file_hash, first_seen_utc, original_path, archived_path, vendor, order_ref
+                )
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (
+                file_hash,
+                first_seen_utc,
+                str(original_path),
+                str(archived_path) if archived_path else None,
+                vendor,
+                order_ref,
+            ))
             conn.commit()
 
 def move_to_duplicates(pdf_path: Path, duplicates_dir: Path) -> Path:
@@ -599,6 +643,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     # Duplicate detection: persistent across runs + within this run
     registry = IngestRegistry(db_path())
     seen_hashes: set[str] = set()
+    archive_dir = imports_run_dir()
 
     def log(msg: str):
         if logger:
@@ -632,11 +677,22 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 
         seen_hashes.add(file_hash)
 
+        original_pdf_path = pdf_path
+        archived_pdf_path = None
+        try:
+            archived_pdf_path = archive_pdf_to_imports(original_pdf_path, archive_dir)
+        except Exception as e:
+            log(f"  ARCHIVE: FAILED ({e}) using original path")
+            archived_pdf_path = original_pdf_path
+
+        pdf_path = archived_pdf_path
+
         parser = pick_parser(str(pdf_path))
         parser_name = getattr(parser, "__name__", None) if parser else "(none)"
 
         log(f"FILE: {pdf_path.name}")
-        log(f"  PATH: {pdf_path}")
+        log(f"  ORIGINAL: {original_pdf_path}")
+        log(f"  ARCHIVED: {pdf_path}")
         log(f"  PARSER: {parser_name}")
 
         if parser is None:
@@ -658,8 +714,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                 "order_uid": order_uid,
                 "file_hash": file_hash,
                 "vendor": vendor,
-                "source_file": pdf_path.name,
+                "source_file": original_pdf_path.name,
                 "pdf_path": str(pdf_path),
+                "original_path": str(original_pdf_path),
+                "archived_path": str(pdf_path),
+                "order_ref": order_ref,
+                "first_seen_utc": datetime.utcnow().isoformat(),
                 "purchase_order": info.get("purchase_order"),
                 "invoice": info.get("invoice"),
                 "invoice_date": info.get("invoice_date"),
@@ -697,7 +757,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                     "order_uid": order_uid,
                     "file_hash": file_hash,
                     "vendor": vendor,
-                    "source_file": pdf_path.name,
+                    "source_file": original_pdf_path.name,
+                    "original_path": str(original_pdf_path),
+                    "archived_path": str(pdf_path),
                     "invoice": info.get("invoice"),
                     "purchase_order": info.get("purchase_order"),
                     "line": line_idx,
@@ -713,9 +775,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                     if k in d and k not in row:
                         row[k] = d.get(k)
                 item_rows.append(row)
-
-            # Mark this PDF as ingested only after successful parse
-            registry.register(file_hash=file_hash, pdf_path=pdf_path, vendor=vendor, order_ref=order_ref)
 
             log("  RESULT: OK\n")
 
@@ -952,8 +1011,9 @@ def init_inventory_db(dbfile: Path):
                 file_hash TEXT PRIMARY KEY,
                 first_seen_utc TEXT NOT NULL,
                 original_path TEXT,
+                archived_path TEXT,
                 vendor TEXT,
-                order_id TEXT
+                order_ref TEXT
             );
         """)
 
@@ -1128,6 +1188,15 @@ def update_database(
     with sqlite3.connect(dbfile) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
 
+        # Record ingested files for duplicate detection + traceability
+        if orders_df is not None and not orders_df.empty and "file_hash" in orders_df.columns:
+            cols = [c for c in ["file_hash", "first_seen_utc", "original_path", "archived_path", "vendor", "order_ref"] if c in orders_df.columns]
+            if cols:
+                ing_df = orders_df[cols].drop_duplicates(subset=["file_hash"]).copy()
+                if "first_seen_utc" not in ing_df.columns:
+                    ing_df["first_seen_utc"] = datetime.utcnow().isoformat()
+                _upsert_df(conn, "ingested_files", ing_df, pk_col="file_hash")
+
         _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
         _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
         _upsert_df(conn, "parts_received", parts_received_df, pk_col="part_key")
@@ -1161,7 +1230,7 @@ def update_database(
 
     return inventory_on_hand_df
 
-def main():
+def main() -> int:
     print("=== Receipt Ingest (CLI) ===")
 
     debug = (input("Debug prints? [y/N]: ").strip().lower() == "y")
@@ -1177,7 +1246,7 @@ def main():
 
         if not pdf_paths:
             logger.log("Nothing selected. Exiting.")
-            return
+            return 2
 
         orders_df, line_items_df, parts_received_df, parts_removed_df = ingest_receipts(pdf_paths, debug=debug, logger=logger)
 
@@ -1210,7 +1279,8 @@ def main():
         export_dir = pick_export_folder(default_export_dir)
         if export_dir is None:
             logger.log("Export cancelled.")
-            return
+            print("\n⚠️  Ingest cancelled (no export folder selected).")
+            return 2
 
         export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1258,8 +1328,14 @@ def main():
         else:
             print(" (DB update skipped; inventory_on_hand not written)")
 
+        if apply_db:
+            return 0
+        else:
+            print("\n⚠️  Ingest cancelled (DB update skipped; CSVs saved).")
+            return 2
+
     finally:
         logger.close()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

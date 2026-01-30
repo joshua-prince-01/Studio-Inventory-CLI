@@ -9,11 +9,13 @@ import shutil
 import sqlite3
 import uuid
 import os
+import sys
 from urllib.parse import quote_plus
 
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
+from studio_inventory.paths import workspace_root, imports_run_dir
 
 
 # ----------------------------
@@ -38,6 +40,23 @@ def suppress_pdfminer_font_warnings() -> None:
         logger.propagate = False
 
 suppress_pdfminer_font_warnings()
+
+def archive_pdf_to_imports(original_path: Path, run_dir: Path) -> Path:
+    """Copy an original PDF into workspace imports/YYYY-MM-DD/, returning the archived path."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = run_dir / original_path.name
+    if dest.exists():
+        stem, suffix = original_path.stem, original_path.suffix
+        i = 2
+        while True:
+            cand = run_dir / f"{stem}__{i}{suffix}"
+            if not cand.exists():
+                dest = cand
+                break
+            i += 1
+    shutil.copy2(str(original_path), str(dest))
+    return dest
+
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
@@ -365,6 +384,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     # Also avoid duplicates within the same selection (before the registry is updated)
     seen_hashes: set[str] = set()
+    archive_dir = imports_run_dir()
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
@@ -382,12 +402,16 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             continue
         seen_hashes.add(file_hash)
 
+        original_pdf_path = pdf_path
+        archived_pdf_path = archive_pdf_to_imports(original_pdf_path, archive_dir)
+        pdf_for_parse = archived_pdf_path
+
         if debug:
             print(f"\\n=== {parser.vendor.upper()} :: {pdf_path.name} ===")
 
         try:
-            order = parser.parse_order(pdf_path, debug=debug)
-            items = parser.parse_line_items(pdf_path, debug=debug)
+            order = parser.parse_order(pdf_for_parse, debug=debug)
+            items = parser.parse_line_items(pdf_for_parse, debug=debug)
         except Exception as e:
             print(f"❌ Parse failed: {pdf_path.name} ({e})")
             continue
@@ -400,6 +424,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         od = dict(order.__dict__)
         od["file_hash"] = file_hash
         od["order_uid"] = order_uid
+        od["first_seen_utc"] = datetime.utcnow().isoformat()
+        od["original_path"] = str(original_pdf_path)
+        od["archived_path"] = str(archived_pdf_path)
+        od["order_ref"] = order_id
+        od["source_file"] = original_pdf_path.name
+        od["pdf_path"] = str(archived_pdf_path)
         order_rows.append(od)
 
         for i, it in enumerate(items):
@@ -408,6 +438,11 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             d.setdefault("order_id", order_id)
             d["file_hash"] = file_hash
             d["order_uid"] = order_uid
+            d["order_ref"] = order_id
+            d["original_path"] = str(original_pdf_path)
+            d["archived_path"] = str(archived_pdf_path)
+            d["source_file"] = original_pdf_path.name
+            d["pdf_path"] = str(archived_pdf_path)
 
             part_number = d.get("part_number") or d.get("sku") or d.get("mfg_part") or ""
             description = d.get("description") or ""
@@ -427,7 +462,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             item_rows.append(d)
 
         # Register only after successful parse (so failures aren't marked as ingested)
-        registry.register(file_hash, pdf_path, vendor=vendor, order_id=order_id)
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
@@ -680,8 +714,9 @@ def init_inventory_db(dbfile: Path):
                 file_hash TEXT PRIMARY KEY,
                 first_seen_utc TEXT NOT NULL,
                 original_path TEXT,
+                archived_path TEXT,
                 vendor TEXT,
-                order_id TEXT
+                order_ref TEXT
             );
         """)
 
@@ -840,6 +875,15 @@ def update_database(orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_
     init_inventory_db(dbfile)
     with sqlite3.connect(dbfile) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
+        # Record ingested files for duplicate detection + traceability
+        if orders_df is not None and not orders_df.empty and "file_hash" in orders_df.columns:
+            cols = [c for c in ["file_hash", "first_seen_utc", "original_path", "archived_path", "vendor", "order_ref"] if c in orders_df.columns]
+            if cols:
+                ing_df = orders_df[cols].drop_duplicates(subset=["file_hash"]).copy()
+                if "first_seen_utc" not in ing_df.columns:
+                    ing_df["first_seen_utc"] = datetime.utcnow().isoformat()
+                _upsert_df(conn, "ingested_files", ing_df, pk_col="file_hash")
+
         _upsert_df(conn, "orders", orders_df, pk_col="order_uid")
         _upsert_df(conn, "line_items", line_items_df, pk_col="line_item_uid")
         _upsert_df(conn, "parts_received", parts_received_df, pk_col="part_key")
@@ -868,15 +912,14 @@ def update_database(orders_df: pd.DataFrame, line_items_df: pd.DataFrame, parts_
         conn.commit()
     return inventory_on_hand_df
 
-def cli():
-    import os
+def cli() -> int:
 
     print("=== Mixed Vendor Receipt Ingest (CLI) ===")
     folder = Path(input("Receipts folder path: ").strip() or ".").expanduser().resolve()
     pdf_paths = sorted(folder.glob("*.pdf")) + sorted(folder.glob("*.PDF"))
     if not pdf_paths:
         print(f"No PDFs found in {folder}")
-        return
+        return 2
 
     debug = (input("Debug prints? [y/N]: ").strip().lower() == "y")
 
@@ -976,6 +1019,10 @@ def cli():
     print("\n✅ Done.")
     print("Per-run CSVs and master CSVs written to:", export_dir)
 
+    if apply_db:
+        return 0
+    print("\n⚠️  Ingest cancelled (DB update skipped; CSVs saved).")
+    return 2
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
