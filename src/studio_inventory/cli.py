@@ -353,13 +353,13 @@ def show_recent_ingests(db: DB):
     t.add_column("original_path")
 
     for r in rows:
-        archived = safe_str(r_get("archived_path"))
+        archived = safe_str(row_get("archived_path"))
         t.add_row(
-            safe_str(r_get("first_seen_utc")),
-            safe_str(r_get("vendor")),
-            safe_str(r_get("order_ref")),
+            safe_str(row_get("first_seen_utc")),
+            safe_str(row_get("vendor")),
+            safe_str(row_get("order_ref")),
             "✅" if archived else "",
-            shorten(r_get("original_path"), 80),
+            shorten(row_get("original_path"), 80),
         )
 
     console.print(t)
@@ -493,9 +493,9 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
 
             t.add_row(
                 str(i),
-                safe_str(r_get("vendor")),
-                safe_str(r_get("order_id") or r_get("order_ref") or ""),
-                safe_str(r_get("order_date")),
+                safe_str(row_get("vendor")),
+                safe_str(row_get("order_id") or row_get("order_ref") or ""),
+                safe_str(row_get("order_date")),
                 total_s,
                 "✅" if arch else "",
             )
@@ -599,12 +599,12 @@ def _show_order_details(db: DB, order_uid: str) -> None:
 
         for r in items:
             it.add_row(
-                safe_str(r_get("line")),
-                safe_str(r_get("sku")),
-                shorten(r_get("description"), 60),
-                safe_str(r_get("units_received") or r_get("shipped") or r_get("ordered") or ""),
-                safe_str(r_get("unit_price") or ""),
-                safe_str(r_get("line_total") or ""),
+                safe_str(row_get("line")),
+                safe_str(row_get("sku")),
+                shorten(row_get("description"), 60),
+                safe_str(row_get("units_received") or row_get("shipped") or row_get("ordered") or ""),
+                safe_str(row_get("unit_price") or ""),
+                safe_str(row_get("line_total") or ""),
             )
 
         console.print(it)
