@@ -4,9 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "studio-inventory"
-version = "0.1.0"
-description = "Studio Inventory CLI (receipt ingest, SQLite, labels)"
-readme = "README.md"
+version = "1.1.0"
+description = "Studio inventory CLI"
 requires-python = ">=3.11"
 dependencies = [
   "matplotlib==3.10.8",
@@ -18,6 +17,7 @@ dependencies = [
   "requests>=2.32.5",
   "requests-pkcs12>=1.27",
   "typer>=0.21.1",
+  "rich>=10.11.0",
 ]
 
 [project.scripts]
@@ -28,3 +28,5 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["studio_inventory*"]
+exclude = ["art_studio_org*"]
