@@ -692,12 +692,15 @@ def inv_search(db: DB):
 
     like = f"%{term}%"
     where_sql = """
-    WHERE part_key LIKE ? COLLATE NOCASE
+    WHERE (
+          part_key LIKE ? COLLATE NOCASE
        OR sku LIKE ? COLLATE NOCASE
        OR vendor LIKE ? COLLATE NOCASE
        OR description LIKE ? COLLATE NOCASE
        OR label_short LIKE ? COLLATE NOCASE
+    )
     """
+
     inv_browse(
         db,
         where_sql=where_sql,
