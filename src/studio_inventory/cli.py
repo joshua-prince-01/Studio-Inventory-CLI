@@ -38,8 +38,6 @@ from studio_inventory.labels.presets import list_label_presets, load_label_prese
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
-console = Console()
-
 
 # ----------------------------
 # Helpers
@@ -88,7 +86,6 @@ def shorten(s: str, n: int = 54) -> str:
     s = safe_str(s)
     return s if len(s) <= n else s[: n - 1] + "…"
 
-
 def parse_row_spec(spec: str) -> list[int]:
     """
     Parse "87:200,205,206" into 1-based row numbers (inclusive ranges).
@@ -113,7 +110,6 @@ def parse_row_spec(spec: str) -> list[int]:
             uniq.append(n)
             seen.add(n)
     return uniq
-
 
 def timestamp_slug() -> str:
     # local time is fine for filenames
@@ -161,14 +157,12 @@ def run_legacy_ingest() -> None:
 
     console.print(f"[red]Ingest failed.[/red] exit codes: main={rc}, ingest_all={rc2}")
 
-
 # ----------------------------
 # Export helpers
 # ----------------------------
 def object_columns(db: DB, name: str) -> list[str]:
     info = db.rows(f"PRAGMA table_info({name})")
     return [r["name"] for r in info]
-
 
 def export_sqlite_object_to_csv(
     db: DB,
@@ -206,7 +200,6 @@ def main(ctx: typer.Context):
     """Launch the menu UI when no subcommand is provided."""
     if ctx.invoked_subcommand is None:
         run_menu()
-
 
 def run_menu():
     while True:
@@ -267,7 +260,6 @@ def menu_ingest():
             pause()
         elif choice == "2":
             show_recent_ingests(db)
-
 
 def show_recent_ingests(db: DB):
     console.clear()
@@ -1516,21 +1508,17 @@ def menu_labels():
         if choice == "1":
             labels_generate(db)
 
-
-
 @app.command()
 def inventory():
     """Interactive inventory browser (browse/search/receive/remove/labels fields)."""
     ensure_workspace()
     menu_inventory()
 
-
 @app.command()
 def labels():
     """Interactive label generator (PDF)."""
     ensure_workspace()
     menu_labels()
-
 
 @app.command()
 def diagnostics():

@@ -14,7 +14,6 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import imports_dir
 
 
 # ----------------------------
@@ -46,25 +45,6 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def archive_pdf_to_imports(src_pdf: Path, ingest_date: str | None = None) -> Path:
-    """Copy a source PDF into workspace imports/YYYY-MM-DD/ and return the archived path."""
-    date_str = ingest_date or datetime.now().date().isoformat()
-    dest_dir = imports_dir() / date_str
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / src_pdf.name
-    if dest.exists():
-        stem, suffix = src_pdf.stem, src_pdf.suffix
-        i = 2
-        while True:
-            candidate = dest_dir / f"{stem}__{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-    shutil.copy2(str(src_pdf), str(dest))
-    return dest
 
 
 class IngestRegistry:
@@ -389,8 +369,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
 
-        # Hash + duplicate detection on original bytes so imports/ isn't filled with duplicates.
-
         parser = pick_parser(pdf_path)
         if parser is None:
             print(f"⚠️  No parser matched: {pdf_path.name} (skipping)")
@@ -403,17 +381,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             print(f"🟡 DUPLICATE skipped: {pdf_path.name} → {moved.name}")
             continue
         seen_hashes.add(file_hash)
-
-        # Archive a copy in workspace imports/YYYY-MM-DD/ and parse the archived copy.
-        try:
-            archived_pdf = archive_pdf_to_imports(pdf_path)
-            if debug:
-                print(f"  Archived -> {archived_pdf}")
-            pdf_path = archived_pdf
-        except Exception as e:
-            if debug:
-                print(f"  ⚠️  Archive copy failed (continuing with original): {e}")
-
 
         if debug:
             print(f"\\n=== {parser.vendor.upper()} :: {pdf_path.name} ===")

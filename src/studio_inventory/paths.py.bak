@@ -22,21 +22,13 @@ def ensure_workspace() -> Path:
     """Create the workspace folder structure if missing; return workspace root."""
     root = workspace_root()
     root.mkdir(parents=True, exist_ok=True)
-    for sub in ["receipts", "imports", "exports", "log", "label_presets", "secrets"]:
+    for sub in ["receipts", "exports", "log", "label_presets", "secrets"]:
         (root / sub).mkdir(exist_ok=True)
     return root
 
 
 def receipts_dir() -> Path:
     d = workspace_root() / "receipts"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-
-def imports_dir() -> Path:
-    """Archive of ingested source PDFs organized by date (YYYY-MM-DD)."""
-    d = workspace_root() / "imports"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
