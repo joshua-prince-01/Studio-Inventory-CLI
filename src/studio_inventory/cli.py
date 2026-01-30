@@ -35,6 +35,13 @@ from studio_inventory.db import DB, default_db_path
 from studio_inventory.labels.make_pdf import make_labels_pdf, LabelTemplate
 from studio_inventory.labels.presets import list_label_presets, load_label_preset, save_label_preset
 
+@app.callback(invoke_without_command=True)
+def _main(ctx: typer.Context):
+    """
+    Menu-first CLI (default). If a subcommand is provided, run it.
+    """
+    if ctx.invoked_subcommand is None:
+        _run_main_menu()
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -45,7 +52,6 @@ console = Console()
 # ----------------------------
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
 
 def ensure_inventory_events_table(db: DB) -> None:
     # Unified audit log for manual receive/remove actions
@@ -64,7 +70,6 @@ def ensure_inventory_events_table(db: DB) -> None:
         )
         """
     )
-
 
 def header():
     console.print(Panel.fit("[bold]Studio Inventory[/bold]\nMenu-first CLI", border_style="cyan"))
@@ -142,7 +147,6 @@ def run_module_in_subprocess(module_name: str) -> int:
         console.print("\n[yellow]Cancelled.[/yellow]")
         return 130
 
-
 def run_legacy_ingest() -> None:
     """
     Tries the most likely current entrypoint first.
@@ -199,7 +203,6 @@ def export_sqlite_object_to_csv(
             w.writerow([r[c] for c in cols])
 
     console.print(f"[green]Exported[/green] {name} → [cyan]{out_path}[/cyan] ({len(rows)} rows)")
-
 
 # ----------------------------
 # Menu-first entry
@@ -305,7 +308,6 @@ def show_recent_ingests(db: DB):
     console.print(t)
     pause()
 
-
 # ----------------------------
 # Export (implemented)
 # ----------------------------
@@ -383,7 +385,6 @@ def menu_export():
             console.print(f"[red]Export failed:[/red] {e}")
 
         pause()
-
 
 # ----------------------------
 # Inventory (unchanged from our last version; kept here)
@@ -657,6 +658,7 @@ def inv_browse(
                 part_key = rows[target_offset]["part_key"]
                 inv_show(db, part_key=part_key)
             continue
+
 def inv_search(db: DB):
     console.clear()
     header()
@@ -681,7 +683,6 @@ def inv_search(db: DB):
         title=f"Search: {term}",
         order_by="on_hand DESC, vendor, sku",
     )
-
 
 def inv_show(db: DB, part_key: str | None = None):
     console.clear()
@@ -736,7 +737,6 @@ def inv_show(db: DB, part_key: str | None = None):
 
     pause()
 
-
 def pick_part_keys_from_browser(db: DB, title: str) -> list[str]:
     console.clear()
     header()
@@ -746,10 +746,6 @@ def pick_part_keys_from_browser(db: DB, title: str) -> list[str]:
     if not sel:
         return []
     return _fetch_selected_part_keys(db, sel)
-
-
-
-
 
 def inv_remove(db: DB):
     console.clear()
@@ -809,8 +805,6 @@ def inv_remove(db: DB):
 
     console.print("[green]Logged removal.[/green] inventory_view on_hand will update automatically.")
     pause()
-
-
 
 def inv_receive(db: DB):
     console.clear()
@@ -927,8 +921,6 @@ def inv_receive(db: DB):
     console.print("[green]Receive complete.[/green]")
     pause()
 
-
-
 def inv_edit_labels(db: DB):
     console.clear()
     header()
@@ -1023,7 +1015,6 @@ def menu_db_diagnostics():
     console.print(t)
     pause()
 
-
 # ----------------------------
 # Future stubs
 # ----------------------------
@@ -1033,8 +1024,6 @@ def menu_vendors():
     console.print("[bold]Vendors[/bold]\n")
     console.print("Next: DigiKey OAuth + product/media enrichment, then McMaster cert-based API enrichment.")
     pause()
-
-
 
 # ----------------------------
 # Labels
@@ -1068,13 +1057,11 @@ def _open_pdf(path: Path) -> None:
     except Exception:
         pass
 
-
 def list_label_templates() -> list[Path]:
     d = project_root() / "label_templates"
     if not d.exists():
         return []
     return sorted(d.glob("*.json"))
-
 
 def pick_label_template() -> Path | None:
     templates = list_label_templates()
@@ -1110,7 +1097,6 @@ def pick_label_template() -> Path | None:
         return None
     return templates[choice - 1]
 
-
 def _combine_where(base_where: str, dyn_where: str) -> str:
     base_where = base_where or ""
     dyn_where = dyn_where or ""
@@ -1119,7 +1105,6 @@ def _combine_where(base_where: str, dyn_where: str) -> str:
     if base_where.strip():
         return base_where.rstrip() + " AND " + dyn_where.strip() + " "
     return " WHERE " + dyn_where.strip() + " "
-
 
 def _fetch_selected_part_keys(db: DB, sel: dict) -> list[str]:
     row_nums: list[int] = sel.get("row_nums", []) or []
@@ -1147,7 +1132,6 @@ def _fetch_selected_part_keys(db: DB, sel: dict) -> list[str]:
             part_keys.append(key_rows[n - 1]["part_key"])
     return part_keys
 
-
 def _fetch_label_rows(db: DB, part_keys: list[str]) -> list[dict]:
     if not part_keys:
         return []
@@ -1163,7 +1147,6 @@ def _fetch_label_rows(db: DB, part_keys: list[str]) -> list[dict]:
     by_key = {r["part_key"]: dict(r) for r in got}
     return [by_key[k] for k in part_keys if k in by_key]
 
-
 def _default_layout_for_template(tpl_path: Path) -> dict:
     try:
         t = LabelTemplate.from_json(tpl_path)
@@ -1178,7 +1161,6 @@ def _default_layout_for_template(tpl_path: Path) -> dict:
         ],
         "qr": {"enabled": True, "source": "purchase_url", "pos": "UR", "span": 1, "span_y": 1, "fit": False, "pad_rel": 0.06, "size_rel": 0.45},
     }
-
 
 def _pick_or_create_layout(tpl_path: Path) -> tuple[dict, str | None]:
     presets = list_label_presets(project_root(), tpl_path)
@@ -1204,7 +1186,6 @@ def _pick_or_create_layout(tpl_path: Path) -> tuple[dict, str | None]:
     else:
         console.print("[dim]No presets yet. Starting from default.[/dim]")
         return _default_layout_for_template(tpl_path), None
-
 
 def _edit_elements(layout: dict, tpl_font_size: int) -> None:
     console.print("\n[bold]Available elements[/bold]")
@@ -1345,7 +1326,6 @@ def _edit_qr(layout: dict) -> None:
 
     layout["qr"] = qr_cfg
 
-
 def _layout_summary(layout: dict) -> None:
     elems = layout.get("elements", []) or []
     qr_cfg = layout.get("qr", {}) or {}
@@ -1380,7 +1360,6 @@ def _layout_summary(layout: dict) -> None:
         f"fit={qr_cfg.get('fit', False)} "
         f"pad_rel={qr_cfg.get('pad_rel','')} size_rel={qr_cfg.get('size_rel','')}[/dim]"
     )
-
 
 def labels_generate(db: DB):
     console.clear()
@@ -1494,7 +1473,6 @@ def labels_generate(db: DB):
             console.print(f"[green]Exported:[/green] {out_pdf}")
             pause()
 
-
 def menu_labels():
     db = get_db()
     while True:
@@ -1512,7 +1490,6 @@ def menu_labels():
             return
         if choice == "1":
             labels_generate(db)
-
 
 
 # ----------------------------
@@ -1612,6 +1589,43 @@ def init():
     typer.echo("  - label_presets/")
     typer.echo("  - secrets/")
 
+def _run_main_menu() -> None:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+
+    console = Console()
+
+    while True:
+        console.print(Panel.fit(
+            "[bold]Studio Inventory[/bold]\n[dim]Menu-first CLI[/dim]",
+            border_style="cyan"
+        ))
+
+        console.print("  1. Ingest receipts / packing lists")
+        console.print("  2. Export data (CSV)")
+        console.print("  3. Inventory browse / search / receive / remove  [dim](coming back next)[/dim]")
+        console.print("  4. Vendors enrich (McMaster / DigiKey)           [dim](coming back next)[/dim]")
+        console.print("  5. Labels generate PDFs                          [dim](coming back next)[/dim]")
+        console.print("  6. DB diagnostics                                [dim](coming back next)[/dim]")
+        console.print("  0. Quit")
+
+        choice = Prompt.ask("\nChoose [1/2/3/4/5/6/0]", default="0").strip()
+
+        if choice == "0":
+            return
+
+        if choice == "1":
+            # Run the existing ingest program (interactive)
+            subprocess.run([sys.executable, "-m", "studio_inventory.main"], check=False)
+            continue
+
+        if choice == "2":
+            # Drop into the export subcommand help (or implement interactive export picker later)
+            subprocess.run([sys.executable, "-m", "studio_inventory.cli", "export", "--help"], check=False)
+            continue
+
+        console.print("[yellow]That menu option isn’t re-wired yet in the installable CLI.[/yellow]\n")
 
 if __name__ == "__main__":
     app()
