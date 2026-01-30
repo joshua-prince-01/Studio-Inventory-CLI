@@ -14,7 +14,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import imports_dir
+from studio_inventory.paths import workspace_root, imports_run_dir
 
 
 # ----------------------------
@@ -46,25 +46,6 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def archive_pdf_to_imports(src_pdf: Path, ingest_date: str | None = None) -> Path:
-    """Copy a source PDF into workspace imports/YYYY-MM-DD/ and return the archived path."""
-    date_str = ingest_date or datetime.now().date().isoformat()
-    dest_dir = imports_dir() / date_str
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / src_pdf.name
-    if dest.exists():
-        stem, suffix = src_pdf.stem, src_pdf.suffix
-        i = 2
-        while True:
-            candidate = dest_dir / f"{stem}__{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-    shutil.copy2(str(src_pdf), str(dest))
-    return dest
 
 
 class IngestRegistry:
@@ -126,6 +107,23 @@ def move_to_duplicates(pdf_path: Path) -> Path:
             i += 1
 
     return Path(shutil.move(str(pdf_path), str(dest)))
+
+
+def archive_pdf_to_imports(src_pdf: Path, run_dir: Path) -> Path:
+    """Copy src_pdf into run_dir, avoiding name collisions."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = run_dir / src_pdf.name
+    if dest.exists():
+        stem, suffix = src_pdf.stem, src_pdf.suffix
+        i = 2
+        while True:
+            candidate = run_dir / f"{stem}__{i}{suffix}"
+            if not candidate.exists():
+                dest = candidate
+                break
+            i += 1
+    shutil.copy2(str(src_pdf), str(dest))
+    return dest
 
 
 _WS = re.compile(r"\s+")
@@ -376,9 +374,12 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """Parse a mixed set of vendor PDFs into orders, line_items, and inventory rollups."""
 
     # Persistent registry so re-runs don't re-ingest the same PDF bytes
-    project_root = Path(__file__).resolve().parents[1]
-    dbfile = project_root / "studio_inventory.sqlite"
+    dbfile = workspace_root() / "studio_inventory.sqlite"
     registry = IngestRegistry(dbfile)
+
+    # Archive folder for this run
+    run_import_dir = imports_run_dir()
+    print(f"Ingest archive folder: {run_import_dir}")
 
     order_rows = []
     item_rows = []
@@ -389,13 +390,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
 
-        # Hash + duplicate detection on original bytes so imports/ isn't filled with duplicates.
-
-        parser = pick_parser(pdf_path)
-        if parser is None:
-            print(f"⚠️  No parser matched: {pdf_path.name} (skipping)")
-            continue
-
+        # Hash first so we can skip duplicates without cluttering the archive.
         file_hash = sha256_file(pdf_path)
 
         if (file_hash in seen_hashes) or registry.has_hash(file_hash):
@@ -404,23 +399,23 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             continue
         seen_hashes.add(file_hash)
 
-        # Archive a copy in workspace imports/YYYY-MM-DD/ and parse the archived copy.
+        # Copy into imports/YYYY-MM-DD and parse the archived copy.
         try:
-            archived_pdf = archive_pdf_to_imports(pdf_path)
-            if debug:
-                print(f"  Archived -> {archived_pdf}")
-            pdf_path = archived_pdf
-        except Exception as e:
-            if debug:
-                print(f"  ⚠️  Archive copy failed (continuing with original): {e}")
+            archived_pdf = archive_pdf_to_imports(pdf_path, run_import_dir)
+        except Exception:
+            archived_pdf = pdf_path
 
+        parser = pick_parser(str(archived_pdf))
+        if parser is None:
+            print(f"⚠️  No parser matched: {pdf_path.name} (skipping)")
+            continue
 
         if debug:
-            print(f"\\n=== {parser.vendor.upper()} :: {pdf_path.name} ===")
+            print(f"\\n=== {parser.vendor.upper()} :: {archived_pdf.name} ===")
 
         try:
-            order = parser.parse_order(pdf_path, debug=debug)
-            items = parser.parse_line_items(pdf_path, debug=debug)
+            order = parser.parse_order(archived_pdf, debug=debug)
+            items = parser.parse_line_items(archived_pdf, debug=debug)
         except Exception as e:
             print(f"❌ Parse failed: {pdf_path.name} ({e})")
             continue

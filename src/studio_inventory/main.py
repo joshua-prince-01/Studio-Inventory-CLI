@@ -18,7 +18,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, log_dir, receipts_dir, imports_dir, project_root
+from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root, imports_run_dir
 
 # ----------------------------
 # Simple run logger
@@ -73,6 +73,31 @@ def create_run_log(echo: bool = True) -> RunLogger:
     logger.log(f"Workspace root: {root}")
     logger.log(f"CWD: {Path.cwd().resolve()}")
     return logger
+
+
+# ----------------------------
+# Ingest archive (imports/YYYY-MM-DD)
+# ----------------------------
+
+def archive_pdf_to_imports(src_pdf: Path, run_dir: Path) -> Path:
+    """Copy src_pdf into run_dir, avoiding name collisions.
+
+    Returns the destination path.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = run_dir / src_pdf.name
+    if dest.exists():
+        stem, suffix = src_pdf.stem, src_pdf.suffix
+        i = 2
+        while True:
+            candidate = run_dir / f"{stem}__{i}{suffix}"
+            if not candidate.exists():
+                dest = candidate
+                break
+            i += 1
+
+    shutil.copy2(str(src_pdf), str(dest))
+    return dest
 
 
 # ----------------------------
@@ -184,6 +209,10 @@ def pick_pdfs_in_folder(folder: Path) -> list[Path]:
 
 
 # ----------------------------
+# Imports archive (photo-manager style)
+# ----------------------------
+
+# ----------------------------
 # Export folder picker
 # ----------------------------
 
@@ -284,31 +313,6 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def archive_pdf_to_imports(src_pdf: Path, ingest_date: str | None = None) -> Path:
-    """Copy a source PDF into workspace imports/YYYY-MM-DD/ and return the archived path.
-
-    This gives users a stable, known place to find the exact source document used for ingest.
-    We copy (do not move) so the original receipts folder remains untouched.
-    """
-    date_str = ingest_date or datetime.now().date().isoformat()
-    dest_dir = imports_dir() / date_str
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    dest = dest_dir / src_pdf.name
-    if dest.exists():
-        stem, suffix = src_pdf.stem, src_pdf.suffix
-        i = 2
-        while True:
-            candidate = dest_dir / f"{stem}__{i}{suffix}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-
-    shutil.copy2(str(src_pdf), str(dest))
-    return dest
 
 class IngestRegistry:
     """
@@ -625,17 +629,14 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     registry = IngestRegistry(db_path())
     seen_hashes: set[str] = set()
 
-    def log(msg: str):
-        if logger:
-            logger.log(msg)
-        else:
-            print(msg)
+    # Archive all ingested PDFs to workspace imports/YYYY-MM-DD/
+    run_import_dir = imports_run_dir()
+    log = (logger.log if logger else print)
+    log(f"Ingest archive folder: {run_import_dir}")
+    _log = log
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
-
-        # Hash + duplicate detection should run on the *original* file bytes
-        # so we don't fill imports/ with duplicates.
 
         # Hash the file first so we can skip/move duplicates before any parsing work
         try:
@@ -653,40 +654,41 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
         if dup_reason:
             try:
                 moved = move_to_duplicates(pdf_path, pdf_path.parent / "duplicates")
-                log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
+                _log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
             except Exception:
-                log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {pdf_path}\n")
+                _log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {pdf_path}\n")
             continue
 
         seen_hashes.add(file_hash)
 
-        # Archive a copy of the source PDF into workspace imports/YYYY-MM-DD/
-        # and parse from that archived copy.
+        # Copy the original PDF into the workspace imports folder and parse from the archived copy.
         try:
-            archived_pdf = archive_pdf_to_imports(pdf_path)
-            log(f"  Archived -> {archived_pdf}")
-            pdf_path = archived_pdf
-        except Exception as e:
-            log(f"  ⚠️  Archive copy failed (continuing with original): {e}")
+            archived_pdf = archive_pdf_to_imports(pdf_path, run_import_dir)
+            _log(f"  ARCHIVED -> {archived_pdf}")
+        except Exception:
+            archived_pdf = pdf_path
+            if logger:
+                logger.exception(f"Failed to archive PDF: {pdf_path}")
+            else:
+                print(f"[WARN] Failed to archive PDF: {pdf_path}")
 
-
-        parser = pick_parser(str(pdf_path))
+        parser = pick_parser(str(archived_pdf))
         parser_name = getattr(parser, "__name__", None) if parser else "(none)"
 
-        log(f"FILE: {pdf_path.name}")
-        log(f"  PATH: {pdf_path}")
-        log(f"  PARSER: {parser_name}")
+        _log(f"FILE: {pdf_path.name}")
+        _log(f"  PATH: {pdf_path}")
+        _log(f"  PARSER: {parser_name}")
 
         if parser is None:
-            log("  RESULT: SKIPPED (no parser matched)\n")
+            _log("  RESULT: SKIPPED (no parser matched)\n")
             continue
 
         if debug:
-            print(f"\n=== Processing: {pdf_path.name} ===")
+            print(f"\n=== Processing: {archived_pdf.name} ===")
             print(f"Using parser: {parser_name}")
 
         try:
-            info = _dictify(parser.parse_order(str(pdf_path), debug=debug))
+            info = _dictify(parser.parse_order(str(archived_pdf), debug=debug))
             vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
 
             order_ref = str(info.get("invoice") or info.get("purchase_order") or "")
@@ -710,9 +712,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                 "total": info.get("total"),
             })
 
-            items = parser.parse_line_items(str(pdf_path), debug=debug) or []
-            log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
-            log(f"  LINE_ITEMS: {len(items)} parsed")
+            items = parser.parse_line_items(str(archived_pdf), debug=debug) or []
+            _log(f"  ORDER: vendor={vendor} invoice={info.get('invoice')} po={info.get('purchase_order')} date={info.get('invoice_date')}")
+            _log(f"  LINE_ITEMS: {len(items)} parsed")
 
             for idx, d in enumerate(items, start=1):
                 line_idx = d.get("line")
@@ -755,7 +757,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             # Mark this PDF as ingested only after successful parse
             registry.register(file_hash=file_hash, pdf_path=pdf_path, vendor=vendor, order_ref=order_ref)
 
-            log("  RESULT: OK\n")
+            _log("  RESULT: OK\n")
 
         except Exception:
             if logger:
@@ -763,7 +765,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             else:
                 print(f"[ERROR] Failed parsing {pdf_path.name} with parser={parser_name}")
                 traceback.print_exc()
-            log("")
+            _log("")
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)

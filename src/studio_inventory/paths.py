@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+from datetime import datetime, date
 
 APP_NAME = "StudioInventory"
 
@@ -22,21 +23,13 @@ def ensure_workspace() -> Path:
     """Create the workspace folder structure if missing; return workspace root."""
     root = workspace_root()
     root.mkdir(parents=True, exist_ok=True)
-    for sub in ["receipts", "imports", "exports", "log", "label_presets", "secrets"]:
+    for sub in ["receipts", "exports", "imports", "log", "label_presets", "secrets"]:
         (root / sub).mkdir(exist_ok=True)
     return root
 
 
 def receipts_dir() -> Path:
     d = workspace_root() / "receipts"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-
-def imports_dir() -> Path:
-    """Archive of ingested source PDFs organized by date (YYYY-MM-DD)."""
-    d = workspace_root() / "imports"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -61,6 +54,21 @@ def label_presets_dir() -> Path:
 
 def secrets_dir() -> Path:
     d = workspace_root() / "secrets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def imports_dir() -> Path:
+    """Workspace archive folder for original PDFs copied at ingest time."""
+    d = workspace_root() / "imports"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def imports_run_dir(run_date: date | None = None) -> Path:
+    """Date-stamped ingest folder inside imports/, e.g. imports/2026-01-30."""
+    stamp = run_date.isoformat() if run_date else datetime.now().strftime("%Y-%m-%d")
+    d = imports_dir() / stamp
     d.mkdir(parents=True, exist_ok=True)
     return d
 
