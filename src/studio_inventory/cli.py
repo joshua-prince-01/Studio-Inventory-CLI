@@ -286,11 +286,11 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists")
-        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
-        menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
-        menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs")
+        menu.add_row("1.", "[bold]Orders[/bold] | ingest/review: receipts / packing lists")
+        menu.add_row("2.", "[bold]Export[/bold] | make: data (CSV / reports)")
+        menu.add_row("3.", "[bold]Inventory[/bold] | browse / search / receive / remove")
+        menu.add_row("4.", "[bold]Vendors[/bold] | enrich: (DigiKey / McMaster) [dim](coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] | generate PDFs")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -463,7 +463,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
     while True:
         console.clear()
         header()
-        console.print("[bold]Orders / receipts[/bold]  [dim](row # details; n/p page; f filter; s sort; q back)[/dim]\n")
+        console.print("[bold]Orders / receipts[/bold]  (row # details; n/p page; f filter; s sort; q back)\n")
 
         where, params = _orders_where(filters)
 
