@@ -17,6 +17,13 @@ A menu-driven CLI for ingesting receipts, managing inventory, and generating lab
 
 ## 1. Install pipx
 
+macOS:
+
+```bash
+python3 -m pip install --user pipx
+```
+
+Linux:
 ```bash
 brew install pipx
 pipx ensurepath
