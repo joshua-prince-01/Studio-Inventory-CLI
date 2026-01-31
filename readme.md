@@ -2,6 +2,8 @@
 
 A menu-driven CLI for ingesting receipts, managing inventory, and generating labels.
 
+Current version: 1.3.1
+
 ---
 
 ## Installation (Recommended: pipx)
