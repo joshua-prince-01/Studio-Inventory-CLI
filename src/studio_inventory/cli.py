@@ -31,7 +31,6 @@ from rich.prompt import Prompt, IntPrompt, FloatPrompt, Confirm
 from rich.table import Table
 
 from studio_inventory.db import DB, default_db_path
-from studio_inventory.main import init_inventory_db
 
 from studio_inventory.labels.make_pdf import make_labels_pdf, LabelTemplate
 from studio_inventory.labels.presets import list_label_presets, load_label_preset, save_label_preset
@@ -216,11 +215,11 @@ def run_menu():
         header()
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "[bold]Ingest[/bold] receipts / packing lists")
-        menu.add_row("2.", "[bold]Export[/bold] data (CSV / reports)")
-        menu.add_row("3.", "[bold]Inventory[/bold] browse / search / receive / remove")
-        menu.add_row("4.", "[bold]Vendors[/bold] enrich (DigiKey / McMaster) [dim](coming soon)[/dim]")
-        menu.add_row("5.", "[bold]Labels[/bold] generate PDFs")
+        menu.add_row("1.", "[bold]Orders[/bold] [dim] ingest receipts / packing lists[/dim]")
+        menu.add_row("2.", "[bold]Export[/bold] [dim]data (CSV / reports)[/dim]")
+        menu.add_row("3.", "[bold]Inventory[/bold] [dim]browse / search / receive / remove[/dim]")
+        menu.add_row("4.", "[bold]Vendors[/bold] [dim]enrich (DigiKey / McMaster) (coming soon)[/dim]")
+        menu.add_row("5.", "[bold]Labels[/bold] [dim]generate PDFs[/dim]")
         menu.add_row("6.", "DB diagnostics")
         menu.add_row("0.", "Quit")
         console.print(menu)
@@ -1368,15 +1367,12 @@ def inv_edit_labels(db: DB):
 def menu_db_diagnostics():
     db_path = default_db_path()
 
-    console.clear()
-    header()
-    console.print("[bold]DB diagnostics[/bold]
-")
-    console.print(f"DB path: [cyan]{db_path}[/cyan]")
-    console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}
-")
-
     if not db_path.exists():
+        console.clear()
+        header()
+        console.print("[bold]DB diagnostics[/bold]\n")
+        console.print(f"DB path: [cyan]{db_path}[/cyan]")
+        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
         pause()
         return
 
@@ -1385,11 +1381,9 @@ def menu_db_diagnostics():
     while True:
         console.clear()
         header()
-        console.print("[bold]DB diagnostics[/bold]
-")
+        console.print("[bold]DB diagnostics[/bold]\n")
         console.print(f"DB path: [cyan]{db_path}[/cyan]")
-        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}
-")
+        console.print(f"DB exists: {'✅' if db_path.exists() else '❌'}\n")
 
         tables = db.rows("""
             SELECT name, type
@@ -1418,23 +1412,19 @@ def menu_db_diagnostics():
         console.print(t)
 
         menu = Table(show_header=False, box=None)
-        menu.add_row("1.", "Clear all data (truncate tables; keep schema)")
-        menu.add_row("2.", "Hard reset (delete DB file; recreate empty schema)")
+        menu.add_row("1.", "Reset database (clear all data)")
         menu.add_row("0.", "Back")
-        console.print("
-")
+        console.print("\n")
         console.print(menu)
 
-        choice = Prompt.ask("
-Choose", choices=["1", "2", "0"], default="0")
+        choice = Prompt.ask("\nChoose", choices=["1", "0"], default="0")
         if choice == "0":
             return
 
         if choice == "1":
-            console.print("
-[red][bold]DANGER[/bold][/red] This will delete ALL rows from all tables (schema stays).")
-            console.print(f"[dim]Target DB:[/dim] {db_path}")
-            if not Confirm.ask("Continue?", default=False):
+            console.print("\n[red][bold]DANGER[/bold][/red] This will permanently delete ALL data in your DB.")
+            ok = Confirm.ask("Continue?", default=False)
+            if not ok:
                 console.print("[yellow]Cancelled.[/yellow]")
                 pause()
                 continue
@@ -1443,49 +1433,20 @@ Choose", choices=["1", "2", "0"], default="0")
                 console.print("[yellow]Cancelled.[/yellow]")
                 pause()
                 continue
+
             try:
-                _truncate_database_contents(db)
-                # Ensure always-present auxiliary table(s) exist after reset
-                ensure_inventory_events_table(db)
-                console.print("[green]Database cleared (tables emptied).[/green]")
+                _reset_database_contents(db)
+                console.print("[green]Database cleared.[/green]")
             except Exception as e:
                 console.print(f"[red]Reset failed:[/red] {e}")
             pause()
-            continue
-
-        if choice == "2":
-            console.print("
-[red][bold]DANGER[/bold][/red] This will DELETE the database file from disk and recreate an empty DB.")
-            console.print(f"[dim]Target DB:[/dim] {db_path}")
-            if not Confirm.ask("Continue?", default=False):
-                console.print("[yellow]Cancelled.[/yellow]")
-                pause()
-                continue
-            token = Prompt.ask("Type DELETE to confirm", default="")
-            if token.strip() != "DELETE":
-                console.print("[yellow]Cancelled.[/yellow]")
-                pause()
-                continue
-            try:
-                _hard_reset_database_file(db_path)
-                console.print("[green]Database file deleted and recreated.[/green]")
-            except Exception as e:
-                console.print(f"[red]Hard reset failed:[/red] {e}")
-            pause()
-            continue
 
 
 def _reset_database_contents(db: DB) -> None:
-    """Backward-compatible: same as truncate."""
-    _truncate_database_contents(db)
-
-def _truncate_database_contents(db: DB) -> None:
     """Delete all rows from all user tables (keeps schema)."""
     with db.connect() as con:
-        # Make truncation resilient to FK order. We'll re-enable at end.
         con.execute("PRAGMA foreign_keys = OFF;")
-        # Use a deterministic order for predictability.
-        rows = con.execute(
+        tables = con.execute(
             """
             SELECT name
             FROM sqlite_master
@@ -1493,49 +1454,14 @@ def _truncate_database_contents(db: DB) -> None:
               AND name NOT LIKE 'sqlite_%'
             """
         ).fetchall()
-        names = sorted([r[0] for r in rows])
 
+        # deterministic order helps with debugging
+        names = sorted([r[0] for r in tables])
         for name in names:
             con.execute(f'DELETE FROM "{name}";')
 
-        # Reset autoincrement sequences if present (harmless if none)
-        try:
-            con.execute("DELETE FROM sqlite_sequence;")
-        except Exception:
-            pass
-
         con.execute("PRAGMA foreign_keys = ON;")
         con.commit()
-
-        # WAL checkpoint + shrink file size (best-effort)
-        try:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        except Exception:
-            pass
-        try:
-            con.execute("VACUUM;")
-        except Exception:
-            pass
-
-def _hard_reset_database_file(db_path: Path) -> None:
-    """Delete the sqlite file (and WAL/SHM) and recreate empty schema."""
-    db_path = Path(db_path)
-
-    # Remove DB + sidecar files if they exist
-    for p in [db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")]:
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            # If file is locked, surface a useful error
-            raise RuntimeError(f"Could not delete {p}. Is another process using the DB?")
-
-    # Recreate schema
-    init_inventory_db(db_path)
-
-    # Ensure auxiliary audit table exists too
-    db = DB(path=db_path)
-    ensure_inventory_events_table(db)
 
 # ----------------------------
 # Future stubs
