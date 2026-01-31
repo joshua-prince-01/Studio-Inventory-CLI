@@ -1,0 +1,10 @@
+{
+  "name": "Avery 5160 / 8160 Address Labels",
+  "page": { "width_in": 8.5, "height_in": 11.0 },
+  "label": { "width_in": 2.625, "height_in": 1.0 },
+  "grid": { "cols": 3, "rows": 10 },
+  "margins_in": { "left": 0.1875, "top": 0.5 },
+  "pitch_in": { "x": 2.75, "y": 1.0 },
+  "padding_in": { "x": 0.08, "y": 0.06 },
+  "font": { "name": "Helvetica", "size": 8 }
+}
