@@ -18,8 +18,6 @@ def default_db_path() -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
-
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 

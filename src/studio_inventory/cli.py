@@ -2438,6 +2438,7 @@ def init():
     Initialize the StudioInventory workspace (DB + folders + default label templates).
     """
     ensure_workspace()
+    console.print(f"📁 Location: {workspace_root()}")
     root = workspace_root()
 
     # Seed packaged templates into the user workspace on first run (pipx/wheel safe)
