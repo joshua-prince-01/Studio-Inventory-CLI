@@ -195,18 +195,27 @@ def run_module_in_subprocess(module_name: str) -> int:
     Run: python -m <module_name> from project root, so relative paths behave.
     Returns process returncode.
     """
+    # Ensure workspace dirs exist, but DO NOT use its return value as a path.
+    ensure_workspace()
+
     cmd = [sys.executable, "-m", module_name]
     console.print(f"\n[dim]Running:[/dim] {' '.join(cmd)}")
+
+    # Run from repo root so relative paths behave while developing in PyCharm.
+    cwd = str(project_root())
+
     try:
-        # Let the child process use the terminal normally (interactive prompts etc.)
-        proc = subprocess.run(cmd, cwd=str(ensure_workspace()))
+        proc = subprocess.run(cmd, cwd=cwd)
         return proc.returncode
-    except FileNotFoundError:
-        console.print("[red]Python executable not found.[/red]")
+    except FileNotFoundError as e:
+        console.print(f"[red]Subprocess failed (FileNotFoundError): {e}[/red]")
+        console.print(f"[red]sys.executable: {sys.executable}[/red]")
+        console.print(f"[red]cwd: {cwd}[/red]")
         return 1
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
         return 130
+
 
 def run_ingest() -> None:
     """Run the ingest entrypoint in a subprocess.
