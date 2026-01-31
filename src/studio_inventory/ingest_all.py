@@ -15,7 +15,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, imports_run_dir, db_path
+from studio_inventory.paths import workspace_root, imports_run_dir
 
 
 # ----------------------------
@@ -147,14 +147,8 @@ def _first_nonempty(obj, names: tuple[str, ...], default: str = "") -> str:
     return default
 
 
-def make_order_uid(vendor: str, order_id: str) -> str:
-    """Stable id for an order.
-
-    IMPORTANT: do NOT include file_hash here.
-    Multiple PDFs (e.g. 'Receipt 123.pdf' and 'Receipt 123(1).pdf') can represent the same order.
-    We want those to dedupe into one order.
-    """
-    key = "|".join([_norm(vendor), _norm(order_id)])
+def make_order_uid(vendor: str, order_id: str, file_hash: str) -> str:
+    key = "|".join([_norm(vendor), _norm(order_id), file_hash])
     return str(uuid.uuid5(NAMESPACE_ORDER, key))
 
 
@@ -324,6 +318,7 @@ def make_line_item_uid(
     *,
     vendor: str,
     order_id: str,
+    file_hash: str,
     line_index: int,
     part_number: str = "",
     description: str = "",
@@ -333,6 +328,7 @@ def make_line_item_uid(
     key = "|".join([
         _norm(vendor),
         _norm(order_id),
+        file_hash,
         str(line_index),
         _norm(part_number),
         _norm(description),
@@ -379,9 +375,8 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """Parse a mixed set of vendor PDFs into orders, line_items, and inventory rollups."""
 
     # Persistent registry so re-runs don't re-ingest the same PDF bytes
-    #from studio_inventory.paths import db_path
-    dbfile = db_path()
-
+    project_root = Path(__file__).resolve().parents[1]
+    dbfile = project_root / "studio_inventory.sqlite"
     registry = IngestRegistry(dbfile)
 
     order_rows = []
@@ -389,19 +384,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     # Also avoid duplicates within the same selection (before the registry is updated)
     seen_hashes: set[str] = set()
-    seen_orders: set[str] = set()
     archive_dir = imports_run_dir()
-
-    def order_exists(order_uid: str) -> bool:
-        try:
-            with sqlite3.connect(dbfile) as _conn:
-                row = _conn.execute(
-                    "SELECT 1 FROM orders WHERE order_uid = ? LIMIT 1;",
-                    (order_uid,),
-                ).fetchone()
-            return row is not None
-        except Exception:
-            return False
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
@@ -436,18 +419,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         vendor = getattr(parser, "vendor", None) or _first_nonempty(order, ("vendor",), default="unknown") or "unknown"
         order_id = _first_nonempty(order, ("order_id", "order", "invoice", "invoice_no", "id", "number"), default="unknown")
 
-        order_uid = make_order_uid(vendor, order_id)
-
-        if order_uid in seen_orders or order_exists(order_uid):
-            moved = move_to_duplicates(original_pdf_path)
-            print(f"🟡 DUPLICATE skipped (order): {original_pdf_path.name} → {moved.name}")
-            try:
-                if archived_pdf_path.exists() and archived_pdf_path != original_pdf_path:
-                    archived_pdf_path.unlink()
-            except Exception:
-                pass
-            continue
-        seen_orders.add(order_uid)
+        order_uid = make_order_uid(vendor, order_id, file_hash)
 
         od = dict(order.__dict__)
         od["file_hash"] = file_hash
@@ -480,6 +452,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             d["line_item_uid"] = make_line_item_uid(
                 vendor=vendor,
                 order_id=order_id,
+                file_hash=file_hash,
                 line_index=i,
                 part_number=str(part_number),
                 description=str(description),
@@ -492,6 +465,19 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     orders_df = pd.DataFrame(order_rows)
     line_items_df = pd.DataFrame(item_rows)
+
+    # Normalize order_date into sortable ISO (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+    if not orders_df.empty:
+        if "order_date" not in orders_df.columns:
+            orders_df["order_date"] = ""
+        def _pick_date(r):
+            for k in ("order_date", "invoice_date", "date", "invoice_dt"):
+                v = r.get(k)
+                if v:
+                    return v
+            return ""
+        raw = orders_df.apply(_pick_date, axis=1)
+        orders_df["order_date"] = raw.apply(lambda s: normalize_datetime_iso(s) or "")
 
     # Add label fields for all vendors (for drawer/bin labels)
     if not line_items_df.empty:

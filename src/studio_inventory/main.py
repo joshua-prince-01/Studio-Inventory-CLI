@@ -19,14 +19,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import (workspace_root,
-                                    log_dir,
-                                    receipts_dir,
-                                    project_root,
-                                    imports_run_dir,
-                                    db_path,
-                                    exports_dir)
-
+from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root, imports_run_dir
 
 # ----------------------------
 # Simple run logger
@@ -406,20 +399,19 @@ def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     return _WS.sub(" ", s)
 
-def make_order_uid(*, vendor: str, order_ref: str) -> str:
-    """Stable order ID (vendor + order_ref).
-
-    IMPORTANT: do NOT include file_hash here.
-    Multiple PDFs can represent the same order (e.g. 'Receipt 123.pdf' and 'Receipt 123(1).pdf').
-    We want those to dedupe into ONE order row.
+def make_order_uid(*, vendor: str, order_ref: str, file_hash: str) -> str:
     """
-    key = "|".join([_norm(vendor), _norm(order_ref)])
+    Stable-ish order ID.
+    If you want it stable across multiple PDFs for the "same order", change the key to exclude file_hash.
+    """
+    key = "|".join([_norm(vendor), _norm(order_ref), file_hash])
     return str(uuid.uuid5(_NAMESPACE_ORDER, key))
 
 def make_line_item_uid(
     *,
     vendor: str,
     order_ref: str,
+    file_hash: str,
     line_index: int,
     sku: str = "",
     description: str = "",
@@ -432,6 +424,7 @@ def make_line_item_uid(
     key = "|".join([
         _norm(vendor),
         _norm(order_ref),
+        file_hash,            # tie to exact source PDF content
         str(line_index),
         _norm(sku),
         _norm(description),
@@ -650,7 +643,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
     # Duplicate detection: persistent across runs + within this run
     registry = IngestRegistry(db_path())
     seen_hashes: set[str] = set()
-    seen_orders: set[str] = set()
     archive_dir = imports_run_dir()
 
     def log(msg: str):
@@ -658,19 +650,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             logger.log(msg)
         else:
             print(msg)
-
-    def order_exists(order_uid: str) -> bool:
-        """Check whether an order_uid already exists in the main DB."""
-        try:
-            with sqlite3.connect(db_path()) as _conn:
-                row = _conn.execute(
-                    "SELECT 1 FROM orders WHERE order_uid = ? LIMIT 1;",
-                    (order_uid,),
-                ).fetchone()
-            return row is not None
-        except Exception:
-            return False
-
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
@@ -729,28 +708,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
             vendor = (info.get("vendor") or getattr(parser, "VENDOR", None) or "unknown").lower()
 
             order_ref = str(info.get("invoice") or info.get("purchase_order") or "")
-            order_uid = make_order_uid(vendor=vendor, order_ref=order_ref)
-
-            # Order-level duplicate stopper:
-            # - within the selected batch (same vendor+invoice)
-            # - across prior runs (already in DB)
-            if order_uid in seen_orders or order_exists(order_uid):
-                dup_reason = "duplicate order (vendor+invoice)"
-                try:
-                    moved = move_to_duplicates(original_pdf_path, original_pdf_path.parent / "duplicates")
-                    log(f"  RESULT: DUPLICATE ({dup_reason}) moved -> {moved}\n")
-                except Exception:
-                    log(f"  RESULT: DUPLICATE ({dup_reason}) (move failed) skipped: {original_pdf_path}\n")
-                # Best-effort: remove the archived copy we just made (keep workspace clean)
-                try:
-                    if archived_pdf_path and archived_pdf_path.exists() and archived_pdf_path != original_pdf_path:
-                        archived_pdf_path.unlink()
-                except Exception:
-                    pass
-                continue
-
-            seen_orders.add(order_uid)
-
+            order_uid = make_order_uid(vendor=vendor, order_ref=order_ref, file_hash=file_hash)
 
             order_rows.append({
                 "order_uid": order_uid,
@@ -761,6 +719,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                 "original_path": str(original_pdf_path),
                 "archived_path": str(pdf_path),
                 "order_ref": order_ref,
+                "order_date": norm_date or "",
                 "first_seen_utc": datetime.utcnow().isoformat(),
                 "purchase_order": info.get("purchase_order"),
                 "invoice": info.get("invoice"),
@@ -786,6 +745,7 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
                 line_item_uid = make_line_item_uid(
                     vendor=vendor,
                     order_ref=order_ref,
+                    file_hash=file_hash,
                     line_index=int(line_idx),
                     sku=str(d.get("sku") or ""),
                     description=str(d.get("description") or ""),
@@ -962,6 +922,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 # SQLite database (optional) - orders + line_items (+ inventory) + ingested_files registry
 # ----------------------------
 
+def db_path() -> Path:
+    # Single project DB file (auto-created on first run)
+    return workspace_root() / "studio_inventory.sqlite"
 
 def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
@@ -1310,8 +1273,7 @@ def main() -> int:
         # this was commented out becuase it would place the default folder inside where we grabbed reciepts, not
         # the default 'exports' folder of the project:
         #default_export_dir = (receipts_folder.parent / "exports").resolve()
-        default_export_dir = exports_dir().resolve()
-
+        default_export_dir = (workspace_root() / "exports").resolve()
 
         logger.log(f"Default export dir: {default_export_dir}")
 

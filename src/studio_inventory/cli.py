@@ -20,6 +20,7 @@ from studio_inventory.paths import (
     receipts_dir,
     log_dir,
     label_presets_dir,
+    label_templates_dir,
     secrets_dir,
     project_root,
 )
@@ -195,27 +196,18 @@ def run_module_in_subprocess(module_name: str) -> int:
     Run: python -m <module_name> from project root, so relative paths behave.
     Returns process returncode.
     """
-    # Ensure workspace dirs exist, but DO NOT use its return value as a path.
-    ensure_workspace()
-
     cmd = [sys.executable, "-m", module_name]
     console.print(f"\n[dim]Running:[/dim] {' '.join(cmd)}")
-
-    # Run from repo root so relative paths behave while developing in PyCharm.
-    cwd = str(project_root())
-
     try:
-        proc = subprocess.run(cmd, cwd=cwd)
+        # Let the child process use the terminal normally (interactive prompts etc.)
+        proc = subprocess.run(cmd, cwd=str(workspace_root()))
         return proc.returncode
-    except FileNotFoundError as e:
-        console.print(f"[red]Subprocess failed (FileNotFoundError): {e}[/red]")
-        console.print(f"[red]sys.executable: {sys.executable}[/red]")
-        console.print(f"[red]cwd: {cwd}[/red]")
+    except FileNotFoundError:
+        console.print("[red]Python executable not found.[/red]")
         return 1
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
         return 130
-
 
 def run_ingest() -> None:
     """Run the ingest entrypoint in a subprocess.
@@ -444,11 +436,14 @@ def _orders_sort_prompt() -> str:
     console.print("  1) newest ingested (default)")
     console.print("  2) vendor, order")
     console.print("  3) total desc")
-    choice = Prompt.ask("Choose", choices=["1","2","3"], default="1")
+    console.print("  4) date desc")
+    choice = Prompt.ask("Choose", choices=["1","2","3","4"], default="1")
     if choice == "2":
         return "o.vendor, o.order_id"
     if choice == "3":
         return "COALESCE(o.total, 0) DESC, o.vendor"
+    if choice == "4":
+        return "COALESCE(o.order_date, '') DESC, o.vendor, o.order_id"
     # Newest ingested (first_seen_utc is ISO)
     return "(i.first_seen_utc IS NULL), i.first_seen_utc DESC, o.order_uid DESC"
 
@@ -495,7 +490,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 o.order_uid,
                 o.vendor,
                 o.order_id,
-                o.invoice_date,
+                o.order_date,
                 o.total,
                 o.file_hash,
                 COALESCE(o.is_voided,0) AS is_voided,
@@ -528,14 +523,14 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 str(i),
                 safe_str(row_get(r, "vendor")),
                 safe_str(row_get(r, "order_id") or row_get(r, "order_ref") or ""),
-                safe_str(row_get(r, "invoice_date")),
+                safe_str(row_get(r, "order_date")),
                 ("VOID" if int(row_get(r, "is_voided") or 0) else ""),
                 total_s,
                 "✅" if arch else "",
             )
 
         console.print(t)
-        console.print(f"\n[dim]Page {page+1}/{max_page+1}[/dim]  •  {total} orders  •  Filters: vendor='{filters['vendor']}' order='{filters['order_id']}' date='{filters['date']}'")
+        console.print(f"\n[dim]Page {page+1}/{max_page+1}  •  {total} orders  •  Filters: vendor='{filters['vendor']}' order='{filters['order_id']}' date='{filters['date']}'[/dim]")
 
         cmd = Prompt.ask("\nCommand")
         cmd = (cmd or "").strip().lower()
@@ -607,7 +602,7 @@ def _show_order_details(db: DB, order_uid: str) -> None:
         else:
             body.append("[bold green]Status:[/bold green] ACTIVE")
         body.append(f"[bold]Order:[/bold] {safe_str(row_get(o, 'order_id') or row_get(o, 'order_ref') or '')}")
-        body.append(f"[bold]Invoice date:[/bold] {safe_str(row_get(o, 'invoice_date'))}")
+        body.append(f"[bold]Order date:[/bold] {safe_str(row_get(o, 'order_date'))}")
         body.append(f"[bold]Ingested:[/bold] {safe_str(row_get(o, 'first_seen_utc'))}")
         body.append(f"[bold]Total:[/bold] {safe_str(row_get(o, 'total'))}")
         body.append(f"[bold]File hash:[/bold] {safe_str(row_get(o, 'file_hash'))}")
@@ -2436,20 +2431,42 @@ def export(
 
     export_sqlite_object_to_csv(db, object_name, out_path)
 
+
 @app.command()
 def init():
     """
-    Initialize the StudioInventory workspace in ~/StudioInventory
+    Initialize the StudioInventory workspace (DB + folders + default label templates).
     """
-    root = ensure_workspace()
+    ensure_workspace()
+    root = workspace_root()
+
+    # Seed packaged templates into the user workspace on first run (pipx/wheel safe)
+    dst = label_templates_dir()
+    copied = 0
+    try:
+        from importlib import resources
+        src_root = resources.files("studio_inventory") / "label_templates"
+        with resources.as_file(src_root) as p:
+            for f in Path(p).glob("*.json"):
+                out = dst / f.name
+                if not out.exists():
+                    out.write_bytes(f.read_bytes())
+                    copied += 1
+    except Exception:
+        pass
 
     typer.echo("✅ StudioInventory workspace initialized")
     typer.echo(f"📁 Location: {root}")
+    if copied:
+        typer.echo(f"🏷️  Seeded {copied} default label templates into label_templates/")
     typer.echo("")
     typer.echo("Created (if missing):")
     typer.echo("  - receipts/")
+    typer.echo("  - imports/")
     typer.echo("  - exports/")
     typer.echo("  - log/")
+    typer.echo("  - duplicates/")
+    typer.echo("  - label_templates/")
     typer.echo("  - label_presets/")
     typer.echo("  - secrets/")
 
