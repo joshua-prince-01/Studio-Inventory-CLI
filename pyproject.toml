@@ -1,23 +1,20 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=67", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "studio-inventory"
 version = "1.1.0"
-description = "Studio inventory CLI"
-requires-python = ">=3.11"
+description = "Menu-driven CLI for studio inventory, receipt ingest, and label generation"
+readme = "readme.md"
+requires-python = ">=3.10"
+
 dependencies = [
-  "matplotlib==3.10.8",
-  "numpy>=2.4.1",
-  "pandas>=3.0.0",
-  "pdfplumber>=0.11.9",
-  "python-dotenv>=1.2.1",
-  "reportlab>=4.4.9",
-  "requests>=2.32.5",
-  "requests-pkcs12>=1.27",
-  "typer>=0.21.1",
-  "rich>=10.11.0",
+    "typer>=0.9",
+    "rich>=13.0",
+    "pandas>=2.0",
+    "pdfplumber>=0.10",
+    "python-dateutil>=2.9",
 ]
 
 [project.scripts]
@@ -26,14 +23,12 @@ studio-inventory = "studio_inventory.cli:app"
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true
-[tool.setuptools.package-data]
-studio_inventory = ["label_templates/*.json"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["studio_inventory*"]
-exclude = ["art_studio_org*"]
 
-
+# 🔑 SINGLE package-data table (this fixes your crash)
 [tool.setuptools.package-data]
-studio_inventory = ["label_templates/*.json"]
+studio_inventory = [
+    "label_templates/*.json",
+]
