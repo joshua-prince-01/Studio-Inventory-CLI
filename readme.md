@@ -9,32 +9,29 @@ A menu-driven CLI for ingesting receipts, managing inventory, and generating lab
 `pipx` installs Python CLI tools in isolated environments and makes them available globally. This keeps the application code separate from your data and avoids dependency conflicts.
 
 ### Requirements
-- macOS or Linux
-- Python 3.10+
-- Homebrew (macOS)
+
+* macOS or Linux
+* Python 3.10+
+* Homebrew (macOS)
 
 ---
 
 ## 1. Install pipx
 
+### Option A (recommended – works everywhere)
+```bash
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+```
+Restart your terminal, then verify:
+```bash
+pipx --version
+```
+### Option B (macOS with Homebrew)
 ```bash
 brew install pipx
 pipx ensurepath
 ```
-
-Restart your terminal or reload your shell:
-
-```bash
-source ~/.zshrc
-```
-
-Verify:
-
-```bash
-pipx --version
-```
-
----
 
 ## 2. Install Studio Inventory from GitHub
 
@@ -144,13 +141,13 @@ pipx reinstall "git+https://github.com/joshua-prince-01/Studio-Inventory-CLI.git
 
 If you are developing the code locally (for example, in PyCharm), you can keep separate workspaces:
 
-- **Development workspace** (used in PyCharm):
+* **Development workspace** (used in PyCharm):
 
 ```bash
 export STUDIO_INV_HOME="$HOME/StudioInventory_DEV"
 ```
 
-- **Production workspace** (used by pipx install):
+* **Production workspace** (used by pipx install):
 
 ```bash
 export STUDIO_INV_HOME="$HOME/StudioInventory"
@@ -179,4 +176,3 @@ $STUDIO_INV_HOME
 ```
 
 The application code itself lives inside pipx’s isolated environment and can be updated or removed without affecting your data.
-
