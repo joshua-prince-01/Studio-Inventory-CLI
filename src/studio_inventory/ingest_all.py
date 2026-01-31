@@ -15,7 +15,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, imports_run_dir
+from studio_inventory.paths import workspace_root, imports_run_dir, db_path
 
 
 # ----------------------------
@@ -379,8 +379,9 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """Parse a mixed set of vendor PDFs into orders, line_items, and inventory rollups."""
 
     # Persistent registry so re-runs don't re-ingest the same PDF bytes
-    from studio_inventory.paths import workspace_root
-    dbfile = workspace_root() / "studio_inventory.sqlite"
+    #from studio_inventory.paths import db_path
+    dbfile = db_path()
+
     registry = IngestRegistry(dbfile)
 
     order_rows = []

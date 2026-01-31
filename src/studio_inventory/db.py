@@ -11,13 +11,13 @@ from typing import Iterable, Optional, Any
 # ----------------------------
 # Roots / paths
 # ----------------------------
-from studio_inventory.paths import workspace_root, project_root
-
+from studio_inventory.paths import db_path
 
 def default_db_path() -> Path:
-    root = workspace_root()
-    root.mkdir(parents=True, exist_ok=True)
-    return root / "studio_inventory.sqlite"
+    p = db_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 
 def utc_now_iso() -> str:

@@ -19,7 +19,14 @@ from urllib.parse import quote_plus
 import pandas as pd
 
 from studio_inventory.vendors.registry import pick_parser
-from studio_inventory.paths import workspace_root, log_dir, receipts_dir, project_root, imports_run_dir
+from studio_inventory.paths import (workspace_root,
+                                    log_dir,
+                                    receipts_dir,
+                                    project_root,
+                                    imports_run_dir,
+                                    db_path,
+                                    exports_dir)
+
 
 # ----------------------------
 # Simple run logger
@@ -955,9 +962,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False, logger: RunLogge
 # SQLite database (optional) - orders + line_items (+ inventory) + ingested_files registry
 # ----------------------------
 
-def db_path() -> Path:
-    # Single project DB file (auto-created on first run)
-    return workspace_root() / "studio_inventory.sqlite"
 
 def _ensure_table(conn: sqlite3.Connection, table: str, pk_col: str):
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" TEXT PRIMARY KEY);')
@@ -1306,7 +1310,8 @@ def main() -> int:
         # this was commented out becuase it would place the default folder inside where we grabbed reciepts, not
         # the default 'exports' folder of the project:
         #default_export_dir = (receipts_folder.parent / "exports").resolve()
-        default_export_dir = (workspace_root() / "exports").resolve()
+        default_export_dir = exports_dir().resolve()
+
 
         logger.log(f"Default export dir: {default_export_dir}")
 
