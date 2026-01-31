@@ -10,12 +10,26 @@ APP_NAME = "StudioInventory"
 def workspace_root() -> Path:
     """Runtime data folder.
 
-    Defaults to ~/StudioInventory.
-    Override with STUDIO_INV_HOME=/path.
+    Priority:
+      1) STUDIO_INV_HOME (explicit override)
+      2) When running from the repo (pyproject.toml present), use ./build/workspace
+      3) Fallback: ~/StudioInventory
+
+    This keeps exports/imports/logs close to the project during development,
+    but still behaves sensibly when installed system-wide.
     """
     env = os.getenv("STUDIO_INV_HOME")
     if env:
         return Path(env).expanduser().resolve()
+
+    # Dev-mode default: put runtime files under the repo's build/ folder
+    try:
+        repo = project_root()
+        if (repo / "pyproject.toml").exists():
+            return (repo / "build" / "workspace").resolve()
+    except Exception:
+        pass
+
     return (Path.home() / APP_NAME).resolve()
 
 

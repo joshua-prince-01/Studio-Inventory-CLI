@@ -147,8 +147,14 @@ def _first_nonempty(obj, names: tuple[str, ...], default: str = "") -> str:
     return default
 
 
-def make_order_uid(vendor: str, order_id: str, file_hash: str) -> str:
-    key = "|".join([_norm(vendor), _norm(order_id), file_hash])
+def make_order_uid(vendor: str, order_id: str) -> str:
+    """Stable id for an order.
+
+    IMPORTANT: do NOT include file_hash here.
+    Multiple PDFs (e.g. 'Receipt 123.pdf' and 'Receipt 123(1).pdf') can represent the same order.
+    We want those to dedupe into one order.
+    """
+    key = "|".join([_norm(vendor), _norm(order_id)])
     return str(uuid.uuid5(NAMESPACE_ORDER, key))
 
 
@@ -318,7 +324,6 @@ def make_line_item_uid(
     *,
     vendor: str,
     order_id: str,
-    file_hash: str,
     line_index: int,
     part_number: str = "",
     description: str = "",
@@ -328,7 +333,6 @@ def make_line_item_uid(
     key = "|".join([
         _norm(vendor),
         _norm(order_id),
-        file_hash,
         str(line_index),
         _norm(part_number),
         _norm(description),
@@ -375,8 +379,8 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
     """Parse a mixed set of vendor PDFs into orders, line_items, and inventory rollups."""
 
     # Persistent registry so re-runs don't re-ingest the same PDF bytes
-    project_root = Path(__file__).resolve().parents[1]
-    dbfile = project_root / "studio_inventory.sqlite"
+    from studio_inventory.paths import workspace_root
+    dbfile = workspace_root() / "studio_inventory.sqlite"
     registry = IngestRegistry(dbfile)
 
     order_rows = []
@@ -384,7 +388,19 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
 
     # Also avoid duplicates within the same selection (before the registry is updated)
     seen_hashes: set[str] = set()
+    seen_orders: set[str] = set()
     archive_dir = imports_run_dir()
+
+    def order_exists(order_uid: str) -> bool:
+        try:
+            with sqlite3.connect(dbfile) as _conn:
+                row = _conn.execute(
+                    "SELECT 1 FROM orders WHERE order_uid = ? LIMIT 1;",
+                    (order_uid,),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
 
     for pdf_path in pdf_paths:
         pdf_path = Path(pdf_path)
@@ -419,7 +435,18 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
         vendor = getattr(parser, "vendor", None) or _first_nonempty(order, ("vendor",), default="unknown") or "unknown"
         order_id = _first_nonempty(order, ("order_id", "order", "invoice", "invoice_no", "id", "number"), default="unknown")
 
-        order_uid = make_order_uid(vendor, order_id, file_hash)
+        order_uid = make_order_uid(vendor, order_id)
+
+        if order_uid in seen_orders or order_exists(order_uid):
+            moved = move_to_duplicates(original_pdf_path)
+            print(f"🟡 DUPLICATE skipped (order): {original_pdf_path.name} → {moved.name}")
+            try:
+                if archived_pdf_path.exists() and archived_pdf_path != original_pdf_path:
+                    archived_pdf_path.unlink()
+            except Exception:
+                pass
+            continue
+        seen_orders.add(order_uid)
 
         od = dict(order.__dict__)
         od["file_hash"] = file_hash
@@ -452,7 +479,6 @@ def ingest_receipts(pdf_paths: list[Path], debug: bool = False):
             d["line_item_uid"] = make_line_item_uid(
                 vendor=vendor,
                 order_id=order_id,
-                file_hash=file_hash,
                 line_index=i,
                 part_number=str(part_number),
                 description=str(description),

@@ -199,7 +199,7 @@ def run_module_in_subprocess(module_name: str) -> int:
     console.print(f"\n[dim]Running:[/dim] {' '.join(cmd)}")
     try:
         # Let the child process use the terminal normally (interactive prompts etc.)
-        proc = subprocess.run(cmd, cwd=str(workspace_root()))
+        proc = subprocess.run(cmd, cwd=str(ensure_workspace()))
         return proc.returncode
     except FileNotFoundError:
         console.print("[red]Python executable not found.[/red]")
