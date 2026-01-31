@@ -2454,34 +2454,38 @@ def export(
 
     export_sqlite_object_to_csv(db, object_name, out_path)
 
-
 @app.command()
 def init():
     """
     Initialize the StudioInventory workspace (DB + folders + default label templates).
     """
     ensure_workspace()
-    console.print(f"📁 Location: {workspace_root()}")
-
-    copied = seed_label_templates()
-    if copied:
-        console.print(f"[dim]Seeded {copied} default label template(s).[/dim]")
+    root = workspace_root()
+    console.print(f"📁 Location: {root}")
 
     # Seed packaged templates into the user workspace on first run (pipx/wheel safe)
     dst = label_templates_dir()
     copied = 0
     try:
         from importlib import resources
-        src_root = resources.files("studio_inventory") / "label_templates"
-        with resources.as_file(src_root) as p:
-            for f in Path(p).glob("*.json"):
-                out = dst / f.name
-                if not out.exists():
-                    out.write_bytes(f.read_bytes())
-                    copied += 1
-    except Exception:
-        pass
 
+        pkg_dir = resources.files("studio_inventory") / "label_templates"
+        if pkg_dir.is_dir():
+            for src in pkg_dir.iterdir():
+                if src.is_file() and src.name.endswith(".json"):
+                    out = dst / src.name
+                    if not out.exists():
+                        with resources.as_file(src) as src_path:
+                            out.write_bytes(src_path.read_bytes())
+                        copied += 1
+    except Exception:
+        copied = 0
+
+    # Keep your dim styling in the Rich console output
+    if copied:
+        console.print(f"[dim]Seeded {copied} default label template(s).[/dim]")
+
+    # Keep your existing Typer echo UX (same lines)
     typer.echo("✅ StudioInventory workspace initialized")
     typer.echo(f"📁 Location: {root}")
     if copied:
@@ -2496,4 +2500,5 @@ def init():
     typer.echo("  - label_templates/")
     typer.echo("  - label_presets/")
     typer.echo("  - secrets/")
+
 
