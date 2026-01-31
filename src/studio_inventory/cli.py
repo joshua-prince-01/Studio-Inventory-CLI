@@ -495,7 +495,7 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 o.order_uid,
                 o.vendor,
                 o.order_id,
-                o.order_date,
+                o.invoice_date,
                 o.total,
                 o.file_hash,
                 COALESCE(o.is_voided,0) AS is_voided,
@@ -528,14 +528,14 @@ def orders_browse(db: DB, *, page_size: int = 20) -> None:
                 str(i),
                 safe_str(row_get(r, "vendor")),
                 safe_str(row_get(r, "order_id") or row_get(r, "order_ref") or ""),
-                safe_str(row_get(r, "order_date")),
+                safe_str(row_get(r, "invoice_date")),
                 ("VOID" if int(row_get(r, "is_voided") or 0) else ""),
                 total_s,
                 "✅" if arch else "",
             )
 
         console.print(t)
-        console.print(f"\n[dim]Page {page+1}/{max_page+1}  •  {total} orders  •  Filters: vendor='{filters['vendor']}' order='{filters['order_id']}' date='{filters['date']}'[/dim]")
+        console.print(f"\n[dim]Page {page+1}/{max_page+1}[/dim]  •  {total} orders  •  Filters: vendor='{filters['vendor']}' order='{filters['order_id']}' date='{filters['date']}'")
 
         cmd = Prompt.ask("\nCommand")
         cmd = (cmd or "").strip().lower()
@@ -607,7 +607,7 @@ def _show_order_details(db: DB, order_uid: str) -> None:
         else:
             body.append("[bold green]Status:[/bold green] ACTIVE")
         body.append(f"[bold]Order:[/bold] {safe_str(row_get(o, 'order_id') or row_get(o, 'order_ref') or '')}")
-        body.append(f"[bold]Order date:[/bold] {safe_str(row_get(o, 'order_date'))}")
+        body.append(f"[bold]Invoice date:[/bold] {safe_str(row_get(o, 'invoice_date'))}")
         body.append(f"[bold]Ingested:[/bold] {safe_str(row_get(o, 'first_seen_utc'))}")
         body.append(f"[bold]Total:[/bold] {safe_str(row_get(o, 'total'))}")
         body.append(f"[bold]File hash:[/bold] {safe_str(row_get(o, 'file_hash'))}")
