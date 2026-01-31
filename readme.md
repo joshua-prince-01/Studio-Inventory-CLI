@@ -1,169 +1,182 @@
-# Studio Inventory
+# Studio Inventory CLI
 
-A deployable, installable CLI for managing studio inventory: ingesting receipts and packing lists, storing structured data in SQLite, exporting CSVs, and generating labels.
-
-This project is designed with a **clean separation between code and data**:
-- **Code** lives in the repository and is installable via `pip`.
-- **Runtime data** (database, receipts, exports, logs) lives in a user workspace at `~/StudioInventory` by default.
+A menu-driven CLI for ingesting receipts, managing inventory, and generating labels.
 
 ---
 
-## Features
+## Installation (Recommended: pipx)
 
-- 📥 Interactive receipt / packing-list ingest
-- 🗄 SQLite-backed inventory database
-- 📤 Non-interactive CSV exports
-- 🏷 Label generation (Avery templates)
-- 🧭 Workspace-aware CLI (safe for pip / pipx installs)
+`pipx` installs Python CLI tools in isolated environments and makes them available globally. This keeps the application code separate from your data and avoids dependency conflicts.
 
----
-
-## Requirements
-
-- Python **3.11+**
-- macOS or Linux (Windows should work but is untested)
+### Requirements
+- macOS or Linux
+- Python 3.10+
+- Homebrew (macOS)
 
 ---
 
-## Installation (Development / Editable)
-
-Clone the repo and install in editable mode:
+## 1. Install pipx
 
 ```bash
-git clone https://github.com/joshua-prince-01/PythonProject_studio_inventory.git
-cd PythonProject_studio_inventory
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+brew install pipx
+pipx ensurepath
 ```
 
-Verify the CLI is available:
+Restart your terminal or reload your shell:
+
+```bash
+source ~/.zshrc
+```
+
+Verify:
+
+```bash
+pipx --version
+```
+
+---
+
+## 2. Install Studio Inventory from GitHub
+
+This installs the CLI from the `main` branch (latest code):
+
+```bash
+pipx install "git+https://github.com/joshua-prince-01/Studio-Inventory-CLI.git@main"
+```
+
+Verify the install:
 
 ```bash
 studio-inventory --help
 ```
 
+You should see the menu and available commands.
+
 ---
 
-## First-Time Setup
+## Workspace & Database Location
 
-Initialize the workspace (creates folders under `~/StudioInventory`):
+Studio Inventory stores **all user data** (database, imports, exports, logs, label presets) in a single **workspace directory**.
+
+The workspace location is controlled by the environment variable:
+
+```bash
+STUDIO_INV_HOME
+```
+
+### Recommended workspace location
+
+```bash
+~/StudioInventory
+```
+
+---
+
+## 3. Create and initialize the workspace
+
+```bash
+mkdir -p ~/StudioInventory
+export STUDIO_INV_HOME="$HOME/StudioInventory"
+```
+
+Initialize the workspace and database:
 
 ```bash
 studio-inventory init
+studio-inventory diagnostics
 ```
 
 This creates:
 
-```
+```text
 ~/StudioInventory/
-├─ receipts/
-├─ exports/
-├─ log/
-├─ label_presets/
-├─ secrets/
-└─ studio_inventory.sqlite
-```
-
-You can override the workspace location with:
-
-```bash
-export STUDIO_INV_HOME=/path/to/workspace
+├── studio_inventory.sqlite
+├── imports/
+├── exports/
+├── log/
+├── duplicates/
+├── label_presets/
+└── secrets/
 ```
 
 ---
 
-## Usage
+## 4. Make the workspace setting permanent (recommended)
 
-### Ingest receipts / packing lists
+Add this line to your shell configuration:
 
 ```bash
-studio-inventory ingest
+echo 'export STUDIO_INV_HOME="$HOME/StudioInventory"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
-- Starts browsing in `~/StudioInventory/receipts`
-- Interactive folder + PDF picker
-- Writes structured data to SQLite
+From now on, the application will always use this workspace.
 
-Optional:
+---
+
+## Running the Application
 
 ```bash
-studio-inventory ingest --workspace ~/StudioInventory
+studio-inventory
+```
+
+You’ll see the interactive menu for ingesting receipts, browsing inventory, exporting data, and generating labels.
+
+---
+
+## Updating the Application
+
+To pull the latest version from GitHub:
+
+```bash
+pipx upgrade studio-inventory
+```
+
+If you installed from a Git branch and want to force a refresh:
+
+```bash
+pipx reinstall "git+https://github.com/joshua-prince-01/Studio-Inventory-CLI.git@main" --force
 ```
 
 ---
 
-### Export data to CSV
+## Development vs Production (Optional)
 
-List tables/views:
+If you are developing the code locally (for example, in PyCharm), you can keep separate workspaces:
 
-```bash
-studio-inventory export --list
-```
-
-Export a table:
+- **Development workspace** (used in PyCharm):
 
 ```bash
-studio-inventory export --object parts
+export STUDIO_INV_HOME="$HOME/StudioInventory_DEV"
 ```
 
-Custom output path:
+- **Production workspace** (used by pipx install):
 
 ```bash
-studio-inventory export --object orders --out ~/Desktop/orders.csv
+export STUDIO_INV_HOME="$HOME/StudioInventory"
 ```
 
+This allows testing new features without touching your production database.
+
 ---
 
-## Project Structure
+## Uninstall
 
-```
-StudioInventory/
-├─ pyproject.toml
-├─ README.md
-├─ src/
-│  └─ studio_inventory/
-│     ├─ cli.py
-│     ├─ main.py
-│     ├─ db.py
-│     ├─ paths.py
-│     ├─ vendors/
-│     └─ labels/
-└─ .gitignore
+```bash
+pipx uninstall studio-inventory
 ```
 
-- `paths.py` is the **single source of truth** for workspace paths
-- No runtime data is written into the repo or site-packages
+Your workspace and database are **not deleted**.
 
 ---
 
-## Git Hygiene
+## Where is my data?
 
-Runtime data is intentionally ignored via `.gitignore`:
+All user data lives inside:
 
-- `.venv/`
-- `exports/`
-- `receipts/`
-- `log/`
-- `label_presets/`
-- `studio_inventory.sqlite`
+```bash
+$STUDIO_INV_HOME
+```
 
-This keeps the repo clean and portable.
-
----
-
-## Roadmap
-
-- Vendor API enrichment (McMaster, DigiKey)
-- Label templates as package resources
-- `studio-inventory doctor` diagnostics command
-- Tests and fixtures
-
----
-
-## License
-
-Private / internal (update as needed).
+The application code itself lives inside pipx’s isolated environment and can be updated or removed without affecting your data.
 
